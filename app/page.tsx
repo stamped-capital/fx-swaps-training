@@ -6,7 +6,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * FX Swaps Training Tool — Single-file Page (Next.js App Router)
  *
  * Tabs:
- * - Home: overview + how to use
+ * - Home: overview + how to use + explainer + Q&A
  * - Basic: one random swap suggestion; user chooses Execute or Reject (test mode)
  * - Guided: 8 tiles (good/marginal/bad), includes CROSS pairs
  * - Manual: swap entry UI with 4-leg boxes; shared scenario state so blotter stays in sync
@@ -20,7 +20,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * - t+1 cashflows net into t+0, horizon shifts
  *
  * Objective:
- * - Square all NON-USD t+0 balances within ±5m (USD exempt)
+ * - Square all NON-USD t+0 positions within ±5m (USD exempt)
  *
  * Constraints:
  * - For each currency, the SUM across the whole row (t0 + all future flows) is forced into (0..10m),
@@ -45,10 +45,16 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  *
  * Basic difficulty:
  * - Suggestions are generated to be ~50/50 good vs bad (challenging).
+ *
+ * Forward points spread:
+ * - Adds a small 1.5bp “not free” spread to forward points to mimic cost of round-tripping.
  */
 
+/* ----------------------------- CCYs (alphabetical) ----------------------------- */
+
 type Ccy = string;
-const CCYS: Ccy[] = ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "SEK", "NOK"];
+// Alphabetical order (as requested for blotter). Removed SEK/NOK, added MXN/PHP.
+const CCYS: Ccy[] = ["AUD", "CAD", "CHF", "EUR", "GBP", "JPY", "MXN", "NZD", "PHP", "USD"];
 
 const HORIZON = 15; // t+0..t+14
 const MAX_DAYS = 80;
@@ -63,17 +69,18 @@ const NONUSD_ROW_TOTAL_MAX = 10_000_000;
 const USD_BASE_LONG = 300_000_000;
 const GUIDED_STEPS_PER_DAY = 10;
 
+// Simplified “static” IR assumptions (annualized).
 const IR: Record<Ccy, number> = {
-  USD: 0.05,
+  AUD: 0.044,
+  CAD: 0.047,
+  CHF: 0.02,
   EUR: 0.035,
   GBP: 0.052,
   JPY: 0.005,
-  CHF: 0.02,
-  CAD: 0.047,
-  AUD: 0.044,
+  MXN: 0.11,
   NZD: 0.05,
-  SEK: 0.035,
-  NOK: 0.045,
+  PHP: 0.065,
+  USD: 0.05,
 };
 
 function clamp(n: number, min: number, max: number) {
@@ -146,17 +153,27 @@ function cashflowView(s: Scenario): Record<Ccy, number[]> {
   return out;
 }
 
+// Forward points spread: 1.5bp applied to the forward points (widened against user).
+const FWD_POINTS_SPREAD_BP = 1.5; // basis points
 function forwardFromSpot(spot: number, buyCcy: Ccy, sellCcy: Ccy, days: number) {
   const T = clamp(days, 0, 3650) / 360;
   const rb = IR[buyCcy] ?? 0.03;
   const rs = IR[sellCcy] ?? 0.03;
-  return (spot * (1 + rs * T)) / (1 + rb * T);
+
+  const theoFwd = (spot * (1 + rs * T)) / (1 + rb * T);
+  const points = theoFwd - spot;
+
+  // Spread in “rate” terms (bps of spot). Apply in the direction that makes points less favourable.
+  const spread = spot * (FWD_POINTS_SPREAD_BP / 10000); // 1.5bp = 0.00015 * spot
+  const widenedPoints = points === 0 ? spread : points + Math.sign(points) * spread;
+
+  return spot + widenedPoints;
 }
 
 type SwapTrade = {
   buyCcy: Ccy;
   sellCcy: Ccy;
-  notionalBuy: number;
+  notionalBuy: number; // amount of buyCcy on near leg (positive)
   nearOffset: number;
   farOffset: number;
   spot: number; // sell per buy
@@ -544,9 +561,7 @@ function generateGuidedTiles(s: Scenario, rates: UsdRates): GuidedTile[] {
     const n = i < 2 ? 0 : pickOne([0, 1]);
     const mag = Math.round(rand(10_000_000, 70_000_000) / 1_000_000) * 1_000_000;
 
-    worses.push(
-      makeTile(buy, sell, mag, n, far, "Worse", -5, `Worse: random swap ${buy}/${sell} likely to worsen today's t+0.`)
-    );
+    worses.push(makeTile(buy, sell, mag, n, far, "Worse", -5, `Worse: random swap ${buy}/${sell} likely to worsen today's t+0.`));
   }
 
   return [best1, best2, ...marginals, ...worses].slice(0, 8).sort(() => Math.random() - 0.5);
@@ -556,7 +571,7 @@ function generateGuidedTiles(s: Scenario, rates: UsdRates): GuidedTile[] {
 
 type BasicSuggestion = SwapTrade & {
   id: string;
-  isGood: boolean;
+  isGood: boolean; // hidden from user, only used for scoring logic
   usdCost: number | null;
 };
 
@@ -741,16 +756,10 @@ function Blotter({
                 return (
                   <td
                     key={t}
-                    className={classNames(
-                      "p-3 text-right tabular-nums transition",
-                      cellClass(v),
-                      hi ? "ring-2 ring-yellow-400 ring-inset" : ""
-                    )}
+                    className={classNames("p-3 text-right tabular-nums transition", cellClass(v), hi ? "ring-2 ring-yellow-400 ring-inset" : "")}
                   >
                     <div className="font-semibold">{formatM(v)}</div>
-                    {hi && typeof pv === "number" ? (
-                      <div className="text-[11px] font-bold text-slate-700 mt-1">prev. {formatM(pv)}</div>
-                    ) : null}
+                    {hi && typeof pv === "number" ? <div className="text-[11px] font-bold text-slate-700 mt-1">prev. {formatM(pv)}</div> : null}
                   </td>
                 );
               })}
@@ -780,6 +789,14 @@ type TradeLogItem = {
   timestamp: number;
   correct?: boolean;
   mode?: "basic" | "guided" | "manual";
+};
+
+type BasicDecision = {
+  id: string;
+  action: "execute" | "reject";
+  wasGood: boolean; // whether the suggested trade would improve t+0 squaring
+  correct: boolean; // whether user's decision matched
+  timestamp: number;
 };
 
 export default function Page() {
@@ -845,8 +862,12 @@ export default function Page() {
   // Shared scenario
   const [scenario, setScenario] = useState<Scenario>(() => generateGuidedSolvableScenario());
 
-  // Trade log
+  // Trade log (actual executed swaps)
   const [tradeLog, setTradeLog] = useState<TradeLogItem[]>([]);
+
+  // Day cost history (tiles): prior days are “locked”; current day is live.
+  const [dayCosts, setDayCosts] = useState<number[]>([]); // index 0 => Day 1 locked cost, etc.
+
   const totalCost = useMemo(() => {
     let t = 0;
     for (const x of tradeLog) if (Number.isFinite(x.usdCost as any)) t += x.usdCost as number;
@@ -872,10 +893,10 @@ export default function Page() {
     ]);
   }
 
-  // Basic score counter (correct out of attempts)
-  const basicAttempts = useMemo(() => tradeLog.filter((x) => x.mode === "basic" && typeof x.correct === "boolean"), [tradeLog]);
-  const basicCorrect = useMemo(() => basicAttempts.filter((x) => x.correct).length, [basicAttempts]);
-  const basicTotal = basicAttempts.length;
+  // Basic decision scoring (counts BOTH execute and reject decisions; rejecting a good trade = incorrect)
+  const [basicDecisions, setBasicDecisions] = useState<BasicDecision[]>([]);
+  const basicCorrect = useMemo(() => basicDecisions.filter((d) => d.correct).length, [basicDecisions]);
+  const basicTotal = basicDecisions.length;
 
   // Guided state
   const [guidedStep, setGuidedStep] = useState(0);
@@ -899,6 +920,8 @@ export default function Page() {
     if (!previewEnabled) return;
     setPreviewScenario(applyFxSwap(scenario, t));
   }
+
+  // Clear preview should NOT exist on Home (we’ll only render the button inside non-home panels)
   function clearPreview() {
     setPreviewScenario(null);
     setManualPreview(null);
@@ -952,6 +975,13 @@ export default function Page() {
     if (!basicIncorrect.active) setBasicSuggestion(buildBasicSuggestion(scenario, rates));
   }, [rates.status, scenario, basicIncorrect.active]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  function recordBasicDecision(action: "execute" | "reject", wasGood: boolean, correct: boolean) {
+    setBasicDecisions((prev) => [
+      { id: id(), action, wasGood, correct, timestamp: Date.now() },
+      ...prev,
+    ]);
+  }
+
   function basicChoose(action: "execute" | "reject") {
     if (!basicSuggestion || ratesRef.current.status !== "ok") return;
 
@@ -959,27 +989,24 @@ export default function Page() {
     const beforeErr = t0ErrorL1(s0.balances);
     const afterScenario = applyFxSwap(s0, basicSuggestion);
     const afterErr = t0ErrorL1(afterScenario.balances);
-    const improves = afterErr < beforeErr;
+    const improves = afterErr < beforeErr; // “good” trade
 
     const correct = action === "execute" ? improves : !improves;
+
+    // Always record the decision; rejecting a good trade will be incorrect (marks you down).
+    recordBasicDecision(action, improves, correct);
 
     if (correct) {
       if (action === "execute") {
         setScenario(afterScenario);
         logTrade(basicSuggestion, true, "basic");
+        setBasicIncorrect({ active: false });
+        setBasicSuggestion(buildBasicSuggestion(afterScenario, ratesRef.current));
       } else {
-        // Reject was correct: log a "virtual" correct decision without applying trade.
-        // We still log with 0-cost and a tiny notional just for scoring? Prefer: log no trade.
-        // But you wanted "how many out of total shown got correct" — so log it with carry = 0.
-        logTrade(
-          { ...basicSuggestion, notionalBuy: 0 },
-          true,
-          "basic"
-        );
+        // Correct reject: do NOT apply trade, and do NOT log a trade (no execution).
+        setBasicIncorrect({ active: false });
+        setBasicSuggestion(buildBasicSuggestion(s0, ratesRef.current));
       }
-
-      setBasicIncorrect({ active: false });
-      setBasicSuggestion(buildBasicSuggestion(action === "execute" ? afterScenario : s0, ratesRef.current));
       return;
     }
 
@@ -998,9 +1025,12 @@ export default function Page() {
     setBasicSuggestion(buildBasicSuggestion(restored, ratesRef.current));
   }
 
-  // Manual swap entry
-  const [mBuy, setMBuy] = useState<Ccy>("EUR");
-  const [mSell, setMSell] = useState<Ccy>("USD");
+  /* ----------------------------- Manual swap entry (Currency 1/2 + toggle) ----------------------------- */
+
+  const [c1, setC1] = useState<Ccy>("EUR");
+  const [c2, setC2] = useState<Ccy>("USD");
+  const [nearBuysC1, setNearBuysC1] = useState(true); // toggle requested
+
   const [mNear, setMNear] = useState<number>(0);
   const [mFar, setMFar] = useState<number>(2);
 
@@ -1018,24 +1048,60 @@ export default function Page() {
     setMFar((f) => (f <= mNear ? Math.min(14, mNear + 2) : f));
   }, [mNear]);
 
+  function getManualBuySell(): { buyCcy: Ccy; sellCcy: Ccy } {
+    // Near leg direction:
+    // - If nearBuysC1: Buy C1 / Sell C2
+    // - Else: Buy C2 / Sell C1
+    return nearBuysC1 ? { buyCcy: c1, sellCcy: c2 } : { buyCcy: c2, sellCcy: c1 };
+  }
+
+  function buildTradeFromManual(): SwapTrade | null {
+    if (ratesRef.current.status !== "ok") return null;
+    if (c1 === c2) return null;
+
+    const { buyCcy, sellCcy } = getManualBuySell();
+
+    const nBuy = parseCommaNumber(nearBuyStr);
+    if (!Number.isFinite(nBuy) || nBuy <= 0) return null;
+
+    const sp = spotFromUsdRates(buyCcy, sellCcy, ratesRef.current);
+    if (!sp) return null;
+    const fw = forwardFromSpot(sp, buyCcy, sellCcy, Math.max(1, mFar - mNear));
+
+    return {
+      buyCcy,
+      sellCcy,
+      notionalBuy: Math.round(nBuy),
+      nearOffset: mNear,
+      farOffset: mFar,
+      spot: sp,
+      fwd: fw,
+    };
+  }
+
+  // Update the 4 boxes when user edits any one box
   useEffect(() => {
     if (ratesRef.current.status !== "ok") return;
-    if (mBuy === mSell) return;
+    if (c1 === c2) return;
 
-    const sp = spotFromUsdRates(mBuy, mSell, ratesRef.current);
+    const { buyCcy, sellCcy } = getManualBuySell();
+
+    const sp = spotFromUsdRates(buyCcy, sellCcy, ratesRef.current);
     if (!sp) return;
-    const fw = forwardFromSpot(sp, mBuy, mSell, Math.max(1, mFar - mNear));
+    const fw = forwardFromSpot(sp, buyCcy, sellCcy, Math.max(1, mFar - mNear));
 
     const computeFromNotionalBuy = (nBuy: number) => {
-      const nearBuy = nBuy;
-      const nearSell = -Math.round(nBuy * sp);
-      const farBuy = -nBuy;
-      const farSell = +Math.round(nBuy * fw);
+      const nearBuy = nBuy; // + buyCcy
+      const nearSell = -Math.round(nBuy * sp); // - sellCcy
+      const farBuy = -nBuy; // - buyCcy
+      const farSell = +Math.round(nBuy * fw); // + sellCcy
 
-      setNearSellStr(formatWithCommasDigitsOnly(String(Math.abs(nearSell))) ? `-${formatWithCommasDigitsOnly(String(Math.abs(nearSell)))}` : "");
-      setFarBuyStr(formatWithCommasDigitsOnly(String(Math.abs(farBuy))) ? `-${formatWithCommasDigitsOnly(String(Math.abs(farBuy)))}` : "");
-      setFarSellStr(formatWithCommasDigitsOnly(String(Math.abs(farSell))) ? `+${formatWithCommasDigitsOnly(String(Math.abs(farSell)))}` : "");
-      setNearBuyStr(formatWithCommasDigitsOnly(String(Math.abs(nearBuy))) ? `${formatWithCommasDigitsOnly(String(Math.abs(nearBuy)))}` : "");
+      const fmtAbs = (x: number) => formatWithCommasDigitsOnly(String(Math.abs(x)));
+
+      setNearBuyStr(fmtAbs(nearBuy) ? `${fmtAbs(nearBuy)}` : "");
+      setNearSellStr(fmtAbs(nearSell) ? `-${fmtAbs(nearSell)}` : "");
+      setFarSellStr(fmtAbs(farSell) ? `+${fmtAbs(farSell)}` : "");
+      setFarBuyStr(fmtAbs(farBuy) ? `-${fmtAbs(farBuy)}` : "");
     };
 
     const inferNotionalBuy = () => {
@@ -1072,35 +1138,26 @@ export default function Page() {
 
     inferNotionalBuy();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mBuy, mSell, mNear, mFar, activeField, nearBuyStr, nearSellStr, farBuyStr, farSellStr, rates.status]);
+  }, [c1, c2, nearBuysC1, mNear, mFar, activeField, nearBuyStr, nearSellStr, farBuyStr, farSellStr, rates.status]);
 
-  function buildTradeFromManual(): SwapTrade | null {
-    if (ratesRef.current.status !== "ok") return null;
-    if (mBuy === mSell) return null;
+  const manualDraftCost = useMemo(() => {
+    if (rates.status !== "ok") return null;
+    const t = buildTradeFromManual();
+    if (!t) return null;
+    const usdC = swapUsdCost({ notionalBuy: t.notionalBuy, spot: t.spot, fwd: t.fwd, sellCcy: t.sellCcy }, rates);
+    return Number.isFinite(usdC) ? usdC : null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rates.status, c1, c2, nearBuysC1, mNear, mFar, nearBuyStr]);
 
-    const nBuy = parseCommaNumber(nearBuyStr);
-    if (!Number.isFinite(nBuy) || nBuy <= 0) return null;
-
-    const sp = spotFromUsdRates(mBuy, mSell, ratesRef.current);
-    if (!sp) return null;
-    const fw = forwardFromSpot(sp, mBuy, mSell, Math.max(1, mFar - mNear));
-
-    return {
-      buyCcy: mBuy,
-      sellCcy: mSell,
-      notionalBuy: Math.round(nBuy),
-      nearOffset: mNear,
-      farOffset: mFar,
-      spot: sp,
-      fwd: fw,
-    };
-  }
+  /* ----------------------------- Reset / Roll ----------------------------- */
 
   function resetAll() {
     const s = generateGuidedSolvableScenario();
     setScenario(s);
     setDayNumber(1);
     setTradeLog([]);
+    setDayCosts([]);
+    setBasicDecisions([]);
 
     setGuidedStep(0);
     setGuidedScore(0);
@@ -1115,8 +1172,10 @@ export default function Page() {
 
     setManualPreview(null);
 
-    setMBuy("EUR");
-    setMSell("USD");
+    // reset manual fields
+    setC1("EUR");
+    setC2("USD");
+    setNearBuysC1(true);
     setMNear(0);
     setMFar(2);
     setActiveField("nearBuy");
@@ -1124,6 +1183,9 @@ export default function Page() {
   }
 
   function rollDay() {
+    // lock in current day's cost into history before resetting today
+    setDayCosts((prev) => [...prev, totalCost]);
+
     setScenario((s) => rollValueDate(s));
     setDayNumber((d) => d + 1);
     setTradeLog([]);
@@ -1146,7 +1208,7 @@ export default function Page() {
   const objectiveBanner = (
     <>
       <div className="text-sm font-semibold text-slate-900">
-        Objective: square all <span className="font-bold">non-USD</span> <span className="font-bold">t+0</span> balances to within{" "}
+        Objective: square all <span className="font-bold">non-USD</span> <span className="font-bold">t+0</span> positions to within{" "}
         <span className="font-bold">±5m</span>. USD is exempt.
       </div>
       <div className="text-sm font-semibold text-slate-900">
@@ -1157,13 +1219,23 @@ export default function Page() {
 
   const ratesList = useMemo(() => {
     const items = CCYS.map((c) => ({ ccy: c, cPerUsd: rates.ccyPerUsd[c], usdPerC: rates.usdPerCcy[c] }));
-    return items.sort((a, b) => (a.ccy === "USD" ? -1 : b.ccy === "USD" ? 1 : a.ccy.localeCompare(b.ccy)));
+    return items.sort((a, b) => a.ccy.localeCompare(b.ccy));
   }, [rates]);
+
+  // Day tiles: show locked days + current day live
+  const dayTiles = useMemo(() => {
+    const locked = dayCosts.map((v, idx) => ({ day: idx + 1, cost: v, locked: true }));
+    const current = { day: dayNumber, cost: totalCost, locked: false };
+    return [...locked, current];
+  }, [dayCosts, dayNumber, totalCost]);
 
   const costPanel = (
     <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4">
       <div className="flex flex-wrap items-start gap-3">
-        <Pill label="Day total USD cost/gain" value={`$${formatInt(totalCost)}`} />
+        {dayTiles.map((d) => (
+          <Pill key={`${d.day}-${d.locked ? "locked" : "live"}`} label={`Day ${d.day} USD cost/gain`} value={`$${formatInt(d.cost)}`} />
+        ))}
+
         <div className="ml-auto flex items-center gap-2">
           <button
             onClick={clearPreview}
@@ -1186,9 +1258,7 @@ export default function Page() {
                   <div className="min-w-0">
                     <div className="text-sm font-semibold text-slate-900 truncate">{t.label}</div>
                     {typeof t.correct === "boolean" ? (
-                      <div className={classNames("text-xs font-bold mt-1", t.correct ? "text-emerald-700" : "text-rose-700")}>
-                        {t.correct ? "Correct" : "Incorrect"}
-                      </div>
+                      <div className={classNames("text-xs font-bold mt-1", t.correct ? "text-emerald-700" : "text-rose-700")}>{t.correct ? "Correct" : "Incorrect"}</div>
                     ) : null}
                     {t.mode ? <div className="text-[11px] font-bold text-slate-500 mt-1">{t.mode.toUpperCase()}</div> : null}
                   </div>
@@ -1200,12 +1270,143 @@ export default function Page() {
           )}
         </div>
         <div className="px-4 py-3 bg-white border-t border-slate-200 flex items-center">
-          <div className="text-sm font-bold text-slate-900">Running total</div>
+          <div className="text-sm font-bold text-slate-900">Running total (today)</div>
           <div className="ml-auto text-sm font-bold text-slate-900">${formatInt(totalCost)}</div>
         </div>
       </div>
     </div>
   );
+
+  /* ----------------------------- Home Q&A (BYO OpenAI key) ----------------------------- */
+
+  const [qaKey, setQaKey] = useState<string>("");
+  const [qaQuestion, setQaQuestion] = useState<string>("");
+  const [qaAnswer, setQaAnswer] = useState<string>("");
+  const [qaStatus, setQaStatus] = useState<"idle" | "loading" | "error" | "ok">("idle");
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("fxswaps_openai_key") ?? "";
+      if (saved) setQaKey(saved);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  function saveQaKey(k: string) {
+    setQaKey(k);
+    try {
+      if (k) localStorage.setItem("fxswaps_openai_key", k);
+      else localStorage.removeItem("fxswaps_openai_key");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function askQuestion() {
+    const q = qaQuestion.trim();
+    if (!q) return;
+    if (!qaKey.trim()) {
+      setQaStatus("error");
+      setQaAnswer("Add an OpenAI API key above to enable Q&A. (Key is stored locally in your browser only.)");
+      return;
+    }
+
+    setQaStatus("loading");
+    setQaAnswer("");
+
+    try {
+      // Simple client-side call. Note: API keys in the browser are not recommended for production.
+      // This is a lightweight “trainer” feature; for real use, move to a server route.
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${qaKey.trim()}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          temperature: 0.2,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a helpful treasury/FX markets tutor. Explain FX spot, forwards, swaps, forward points, carry, and liquidity impacts clearly and practically, using simple examples and trader language.",
+            },
+            { role: "user", content: q },
+          ],
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Request failed (${res.status}). ${text.slice(0, 300)}`);
+      }
+
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content ?? "";
+      setQaAnswer(content || "No answer returned.");
+      setQaStatus("ok");
+    } catch (e: any) {
+      setQaStatus("error");
+      setQaAnswer(e?.message ?? "Q&A error");
+    }
+  }
+
+  /* ----------------------------- Render ----------------------------- */
+
+  // FX rates panel should be slimmer (half width-ish)
+  const fxRatesPanel = (
+    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 max-w-3xl">
+      <div className="flex items-end justify-between gap-3">
+        <div>
+          <div className="text-lg font-semibold text-slate-900">FX Rates vs USD</div>
+          <div className="text-sm font-semibold text-slate-900">Source: frankfurter.app {rates.asOf ? `· As of ${rates.asOf}` : ""}</div>
+        </div>
+        <div className="text-sm font-semibold text-slate-900">{rates.status === "loading" ? "Loading…" : rates.status === "error" ? `Error: ${rates.error}` : "Live"}</div>
+      </div>
+
+      <div className="mt-4 overflow-auto rounded-2xl border border-slate-200">
+        <table className="w-full text-sm">
+          <thead className="bg-white">
+            <tr>
+              <th className="text-left p-2 border-b border-slate-200 text-slate-900 font-semibold">CCY</th>
+              <th className="text-right p-2 border-b border-slate-200 text-slate-900 font-semibold">1 USD =</th>
+              <th className="text-right p-2 border-b border-slate-200 text-slate-900 font-semibold">1 CCY =</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ratesList.map((r) => (
+              <tr key={r.ccy} className="border-b border-slate-100 last:border-b-0">
+                <td className="p-2 font-semibold text-slate-900">{r.ccy}</td>
+                <td className="p-2 text-right font-semibold text-slate-900">
+                  {fmt4(r.cPerUsd)} {r.ccy}
+                </td>
+                <td className="p-2 text-right font-semibold text-slate-900">
+                  {fmt4(r.usdPerC)} USD
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="h-4" />
+      <div className="text-xs font-semibold text-slate-700">Note: Carry/forwards are simplified using static IR assumptions + a small forward-points spread.</div>
+    </div>
+  );
+
+  const { buyCcy: manualBuyCcy, sellCcy: manualSellCcy } = getManualBuySell();
+  const manualSpot = useMemo(() => {
+    if (rates.status !== "ok") return null;
+    if (c1 === c2) return null;
+    return spotFromUsdRates(manualBuyCcy, manualSellCcy, rates);
+  }, [rates.status, c1, c2, manualBuyCcy, manualSellCcy, rates]);
+
+  const manualFwd = useMemo(() => {
+    if (!manualSpot) return null;
+    return forwardFromSpot(manualSpot, manualBuyCcy, manualSellCcy, Math.max(1, mFar - mNear));
+  }, [manualSpot, manualBuyCcy, manualSellCcy, mFar, mNear]);
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -1242,10 +1443,7 @@ export default function Page() {
               Preview: {previewEnabled ? "On" : "Off"}
             </button>
 
-            <button
-              onClick={resetAll}
-              className="px-4 py-2 rounded-xl text-sm font-semibold border border-slate-200 bg-white hover:bg-slate-50 transition text-slate-900"
-            >
+            <button onClick={resetAll} className="px-4 py-2 rounded-xl text-sm font-semibold border border-slate-200 bg-white hover:bg-slate-50 transition text-slate-900">
               Reset
             </button>
 
@@ -1259,18 +1457,14 @@ export default function Page() {
           </div>
         </div>
 
-        <Banner dayNumber={dayNumber} />
-
         {/* HOME */}
         {tab === "home" ? (
           <div className="space-y-4">
             <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6">
               <div className="text-xl font-extrabold text-slate-900">What this tool is</div>
               <p className="mt-3 text-sm font-semibold text-slate-800 leading-relaxed">
-                This simulator is a hands-on training tool for learning how FX swaps change cash positions over a rolling value-date horizon.
-                The blotter is shown in “cashflow view”: <span className="font-bold">t+0 is cash at bank plus executed trades</span>, and <span className="font-bold">t+1..t+14</span> are
-                net cashflows expected on those dates. Every swap you execute updates the blotter so you can build intuition on how near/far legs
-                reshape today’s positions and future liquidity.
+                This simulator is a hands-on training tool for learning how FX swaps change cash positions over a rolling value-date horizon. The blotter is shown in “cashflow view”:{" "}
+                <span className="font-bold">t+0 is cash at bank plus executed trades</span>, and <span className="font-bold">t+1..t+14</span> are net cashflows expected on those dates.
               </p>
 
               <div className="mt-5 grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1278,7 +1472,7 @@ export default function Page() {
                   <div className="text-sm font-extrabold text-slate-900">Your objective</div>
                   <ul className="mt-2 list-disc ml-5 text-sm font-semibold text-slate-800 space-y-1">
                     <li>
-                      Square all <span className="font-bold">non-USD</span> <span className="font-bold">t+0</span> balances within <span className="font-bold">±5m</span>.
+                      Square all <span className="font-bold">non-USD</span> <span className="font-bold">t+0</span> positions within <span className="font-bold">±5m</span>.
                     </li>
                     <li>USD is exempt (but remains large and positive).</li>
                     <li>Use swaps to shift exposures between currencies and across time.</li>
@@ -1295,7 +1489,7 @@ export default function Page() {
                       Move to <span className="font-bold">Guided</span>: choose among multiple swaps (including crosses) and learn trade-offs.
                     </li>
                     <li>
-                      Graduate to <span className="font-bold">Manual</span>: you build swaps yourself using a trader style entry.
+                      Graduate to <span className="font-bold">Manual</span>: you build swaps yourself using a trader-style entry.
                     </li>
                   </ul>
                 </div>
@@ -1305,59 +1499,133 @@ export default function Page() {
                 <div className="rounded-2xl border border-slate-200 bg-white p-4">
                   <div className="text-sm font-extrabold text-slate-900">Basic tab</div>
                   <div className="mt-2 text-sm font-semibold text-slate-800">
-                    You’re shown one swap at a time. Decide whether executing it improves squaring at <span className="font-bold">t+0</span>.
-                    If you’re wrong, the swap applies as a penalty, and the blotter highlights what changed.
+                    One swap at a time. Your job is to decide if it helps squaring at <span className="font-bold">t+0</span>. Wrong decisions execute as a penalty.
                   </div>
                 </div>
 
                 <div className="rounded-2xl border border-slate-200 bg-white p-4">
                   <div className="text-sm font-extrabold text-slate-900">Guided tab</div>
                   <div className="mt-2 text-sm font-semibold text-slate-800">
-                    Multiple swaps are offered, mixing good, marginal, and worse options (including crosses). Execute swaps to drive non-USD t+0
-                    into range while watching cost/gain.
+                    Pick from multiple swaps (good/marginal/worse, including crosses). Execute to bring non-USD t+0 into range while watching cost/gain.
                   </div>
                 </div>
 
                 <div className="rounded-2xl border border-slate-200 bg-white p-4">
                   <div className="text-sm font-extrabold text-slate-900">Manual tab</div>
                   <div className="mt-2 text-sm font-semibold text-slate-800">
-                    Use the trade entry ticket. Change any one box and the others auto-calc. This is the most realistic mode and will prepare you to trade live in-market.
+                    Enter a swap ticket like a trader. Toggle whether you buy Currency 1 or sell Currency 1 on the near leg; legs reverse automatically for the far.
                   </div>
                 </div>
               </div>
 
               <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                <div className="text-sm font-extrabold text-slate-900">Preview toggle & cost tracker</div>
-                <ul className="mt-2 list-disc ml-5 text-sm font-semibold text-slate-800 space-y-1">
-                  <li>
-                    <span className="font-bold">Preview toggle</span>: when ON, Guided/Manual can preview how a swap would change the blotter without committing it.
-                    When OFF, preview controls are hidden to increase difficulty.
-                  </li>
-                  <li>
-                    <span className="font-bold">Cost tracker</span>: logs each executed swap with an approximate USD carry and shows a running total for the day.
-                  </li>
-                </ul>
+                <div className="text-sm font-extrabold text-slate-900">Markets explainer</div>
+
+                <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="text-sm font-extrabold text-slate-900">Spot FX</div>
+                    <div className="mt-2 text-sm font-semibold text-slate-800">
+                      <span className="font-bold">Spot</span> is the price for exchanging two currencies for near settlement (often T+2, sometimes T+1/T+0 depending on pair).
+                      In this trainer, we use spot to value the near leg, and you see the immediate impact on <span className="font-bold">t+0</span> positions.
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="text-sm font-extrabold text-slate-900">Forward FX</div>
+                    <div className="mt-2 text-sm font-semibold text-slate-800">
+                      <span className="font-bold">Forwards</span> lock in an exchange rate for a future date. The forward rate differs from spot because of the{" "}
+                      <span className="font-bold">interest rate differential</span> between the two currencies.
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="text-sm font-extrabold text-slate-900">Forward points</div>
+                    <div className="mt-2 text-sm font-semibold text-slate-800">
+                      <span className="font-bold">Forward points</span> are simply: <span className="font-bold">Forward − Spot</span>. Dealers often quote points rather than the outright forward.
+                      In this app we compute a simple forward using IRs and add a small <span className="font-bold">1.5bp</span> spread to points so it’s not free to round-trip.
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="text-sm font-extrabold text-slate-900">Carry</div>
+                    <div className="mt-2 text-sm font-semibold text-slate-800">
+                      <span className="font-bold">Carry</span> is the P&L you earn/pay from holding currency funding over time (via the IR differential, reflected in forward points).
+                      In swaps, carry shows up as the difference between the near and far exchange amounts.
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="text-sm font-extrabold text-slate-900">Ask a question about forwards/swaps</div>
+                  <div className="mt-2 text-sm font-semibold text-slate-700">
+                    Optional: paste an OpenAI API key to enable an in-app Q&A tutor. (Stored locally in your browser only.)
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                      <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">OpenAI API key</div>
+                      <input
+                        value={qaKey}
+                        onChange={(e) => saveQaKey(e.target.value)}
+                        className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
+                        placeholder="sk-..."
+                      />
+                      <div className="mt-2 text-xs font-semibold text-slate-600">For production, move this to a server API route.</div>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                      <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Your question</div>
+                      <input
+                        value={qaQuestion}
+                        onChange={(e) => setQaQuestion(e.target.value)}
+                        className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
+                        placeholder="e.g. Why do forward points flip sign sometimes?"
+                      />
+                      <button
+                        onClick={askQuestion}
+                        className="mt-3 w-full px-4 py-3 rounded-2xl text-sm font-bold bg-slate-900 text-white hover:bg-slate-800 transition"
+                      >
+                        Ask
+                      </button>
+                    </div>
+                  </div>
+
+                  {qaStatus !== "idle" ? (
+                    <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                      <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Answer</div>
+                      <div className="mt-2 text-sm font-semibold text-slate-900 whitespace-pre-wrap">
+                        {qaStatus === "loading" ? "Thinking…" : qaAnswer}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </div>
+
+            {/* Day banner should sit just above blotter on Home too */}
+            <Banner dayNumber={dayNumber} />
 
             <div className="space-y-2">
               <Blotter scenario={scenario} />
               {objectiveBanner}
             </div>
 
-            {costPanel}
+            {/* Home: hide cost tracker + FX rates (as requested) */}
           </div>
         ) : null}
 
-        {/* Blotter (all non-home tabs) */}
+        {/* Non-home: Day banner always just above blotter */}
         {tab !== "home" ? (
-          <div className="space-y-2">
-            <Blotter
-              scenario={displayScenario}
-              highlightCells={tab === "basic" ? basicIncorrect.changedCells : undefined}
-              prevValues={tab === "basic" ? basicIncorrect.prevValues : undefined}
-            />
-            {objectiveBanner}
+          <div className="space-y-4">
+            <Banner dayNumber={dayNumber} />
+            <div className="space-y-2">
+              <Blotter
+                scenario={displayScenario}
+                highlightCells={tab === "basic" ? basicIncorrect.changedCells : undefined}
+                prevValues={tab === "basic" ? basicIncorrect.prevValues : undefined}
+              />
+              {objectiveBanner}
+            </div>
           </div>
         ) : null}
 
@@ -1366,7 +1634,6 @@ export default function Page() {
           <div className="space-y-4">
             <div className="flex flex-wrap items-center gap-3">
               <Pill label="Solved (current state)" value={solvedNow ? "✅ Yes" : "No"} />
-              <Pill label="Day total cost/gain" value={`$${formatInt(totalCost)}`} />
               <Pill label="Basic accuracy" value={`${basicCorrect} / ${basicTotal}`} />
             </div>
 
@@ -1454,6 +1721,9 @@ export default function Page() {
             </div>
 
             {costPanel}
+
+            {/* FX Rates (slimmer) */}
+            <div>{fxRatesPanel}</div>
           </div>
         ) : null}
 
@@ -1463,7 +1733,6 @@ export default function Page() {
             <div className="flex flex-wrap items-center gap-3">
               <Pill label="Swaps left" value={swapsLeft} />
               <Pill label="Score (out of 100)" value={guidedScore} />
-              <Pill label="Day total cost/gain" value={`$${formatInt(totalCost)}`} />
               {guidedSolved ? (
                 <div className="px-4 py-3 rounded-2xl bg-emerald-100 text-emerald-900 font-bold text-sm border border-emerald-200">
                   ✅ Solved (non-USD t+0 within ±5m)
@@ -1487,19 +1756,13 @@ export default function Page() {
                       <div className="text-sm text-slate-900 font-semibold">
                         Near: t+{t.nearOffset} · Far: t+{t.farOffset}
                       </div>
-                      <div className="text-xs text-slate-900 font-semibold mt-1">
-                        USD carry (approx): {t.usdCost === null ? "—" : `$${formatInt(t.usdCost)}`}
-                      </div>
+                      <div className="text-xs text-slate-900 font-semibold mt-1">USD carry (approx): {t.usdCost === null ? "—" : `$${formatInt(t.usdCost)}`}</div>
                     </div>
                     {revealed.has(t.id) ? (
                       <div
                         className={classNames(
                           "text-xs px-2 py-1 rounded-lg font-semibold",
-                          t.category === "Best"
-                            ? "bg-emerald-100 text-emerald-900"
-                            : t.category === "Marginal"
-                            ? "bg-amber-100 text-amber-900"
-                            : "bg-rose-100 text-rose-900"
+                          t.category === "Best" ? "bg-emerald-100 text-emerald-900" : t.category === "Marginal" ? "bg-amber-100 text-amber-900" : "bg-rose-100 text-rose-900"
                         )}
                       >
                         {t.category} ({t.scoreDelta > 0 ? `+${t.scoreDelta}` : t.scoreDelta})
@@ -1526,10 +1789,7 @@ export default function Page() {
                           return n;
                         });
                       }}
-                      className={classNames(
-                        "px-3 py-2 rounded-xl text-sm font-semibold bg-slate-900 text-white hover:bg-slate-800 transition",
-                        previewEnabled ? "flex-1" : "w-full"
-                      )}
+                      className={classNames("px-3 py-2 rounded-xl text-sm font-semibold bg-slate-900 text-white hover:bg-slate-800 transition", previewEnabled ? "flex-1" : "w-full")}
                     >
                       Execute
                     </button>
@@ -1547,13 +1807,12 @@ export default function Page() {
                   Buy {selected.buyCcy} / Sell {selected.sellCcy} · Near t+{selected.nearOffset} · Far t+{selected.farOffset}
                 </div>
                 <div className="text-sm font-semibold text-slate-900 mt-2">{selected.why}</div>
-                <div className="text-sm font-semibold text-slate-900 mt-2">
-                  Total cost/gain today: <span className="font-bold">${formatInt(totalCost)}</span>
-                </div>
               </div>
             ) : null}
 
             {costPanel}
+
+            <div>{fxRatesPanel}</div>
           </div>
         ) : null}
 
@@ -1564,21 +1823,20 @@ export default function Page() {
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <div className="text-lg font-semibold text-slate-900">Manual swap entry</div>
-                  <div className="text-sm font-semibold text-slate-900 mt-1">
-                    Edit any one box and the rest auto-calc.
-                  </div>
+                  <div className="text-sm font-semibold text-slate-900 mt-1">Edit any one box and the rest auto-calc.</div>
                 </div>
                 <div className="text-sm font-bold text-slate-900">
-                  Day cost/gain: <span className="font-extrabold">${formatInt(totalCost)}</span>
+                  Swap cost/gain: <span className="font-extrabold">{manualDraftCost === null ? "—" : `$${formatInt(manualDraftCost)}`}</span>
                 </div>
               </div>
 
+              {/* Top line stays: currencies + near/far */}
               <div className="mt-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
                 <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                  <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Buy currency</div>
+                  <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Currency 1</div>
                   <select
-                    value={mBuy}
-                    onChange={(e) => setMBuy(e.target.value)}
+                    value={c1}
+                    onChange={(e) => setC1(e.target.value)}
                     className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
                   >
                     {CCYS.map((c) => (
@@ -1590,10 +1848,10 @@ export default function Page() {
                 </div>
 
                 <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                  <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Sell currency</div>
+                  <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Currency 2</div>
                   <select
-                    value={mSell}
-                    onChange={(e) => setMSell(e.target.value)}
+                    value={c2}
+                    onChange={(e) => setC2(e.target.value)}
                     className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
                   >
                     {CCYS.map((c) => (
@@ -1602,7 +1860,7 @@ export default function Page() {
                       </option>
                     ))}
                   </select>
-                  {mSell === mBuy ? <div className="text-xs font-bold text-rose-700 mt-2">Buy and Sell must differ.</div> : null}
+                  {c2 === c1 ? <div className="text-xs font-bold text-rose-700 mt-2">Currency 1 and 2 must differ.</div> : null}
                 </div>
 
                 <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
@@ -1638,63 +1896,98 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* 4-box legs */}
-              <div className="mt-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
-                <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                  <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Near Buy (+ {mBuy})</div>
-                  <input
-                    value={nearBuyStr}
-                    onFocus={() => setActiveField("nearBuy")}
-                    onChange={(e) => setNearBuyStr(formatWithCommasDigitsOnly(e.target.value))}
-                    inputMode="numeric"
-                    className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
-                    placeholder="e.g. 25,000,000"
-                  />
+              {/* Toggle row */}
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                <div className="text-sm font-bold text-slate-900">Near leg direction</div>
+                <button
+                  onClick={() => setNearBuysC1((v) => !v)}
+                  className={classNames(
+                    "px-4 py-2 rounded-xl text-sm font-extrabold border transition",
+                    nearBuysC1 ? "bg-slate-900 text-white border-slate-900 hover:bg-slate-800" : "bg-white text-slate-900 border-slate-200 hover:bg-slate-50"
+                  )}
+                  title="Toggle whether near leg buys Currency 1 or sells Currency 1."
+                >
+                  {nearBuysC1 ? `Buy ${c1} / Sell ${c2} (near)` : `Sell ${c1} / Buy ${c2} (near)`}
+                </button>
+
+                <div className="ml-auto text-sm font-semibold text-slate-700">
+                  {rates.status === "ok" && manualSpot ? (
+                    <>
+                      Spot: <span className="font-bold text-slate-900 ml-1">{manualSpot.toFixed(6)}</span>
+                      <span className="mx-2 text-slate-400">•</span>
+                      Fwd: <span className="font-bold text-slate-900 ml-1">{manualFwd ? manualFwd.toFixed(6) : "—"}</span>
+                    </>
+                  ) : (
+                    <span>Rates: {rates.status === "loading" ? "Loading…" : rates.status === "error" ? "Error" : "—"}</span>
+                  )}
+                </div>
+              </div>
+
+              {/* Re-layout boxes:
+                  Left column: Near Buy (top), Near Sell (bottom)
+                  Right column: Far Sell (top), Far Buy (bottom)
+                  Labels reverse automatically based on toggle (buy/sell ccys swap via manualBuyCcy/manualSellCcy).
+              */}
+              <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-3">
+                <div className="grid grid-rows-2 gap-3">
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Near Buy (+ {manualBuyCcy})</div>
+                    <input
+                      value={nearBuyStr}
+                      onFocus={() => setActiveField("nearBuy")}
+                      onChange={(e) => setNearBuyStr(formatWithCommasDigitsOnly(e.target.value))}
+                      inputMode="numeric"
+                      className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
+                      placeholder="e.g. 25,000,000"
+                    />
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Near Sell (- {manualSellCcy})</div>
+                    <input
+                      value={nearSellStr}
+                      onFocus={() => setActiveField("nearSell")}
+                      onChange={(e) => {
+                        const raw = e.target.value.replace(/[^\d]/g, "");
+                        setNearSellStr(raw ? `-${formatWithCommasDigitsOnly(raw)}` : "");
+                      }}
+                      inputMode="numeric"
+                      className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
+                      placeholder="-…"
+                    />
+                  </div>
                 </div>
 
-                <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                  <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Near Sell (- {mSell})</div>
-                  <input
-                    value={nearSellStr}
-                    onFocus={() => setActiveField("nearSell")}
-                    onChange={(e) => {
-                      const raw = e.target.value.replace(/[^\d]/g, "");
-                      setNearSellStr(raw ? `-${formatWithCommasDigitsOnly(raw)}` : "");
-                    }}
-                    inputMode="numeric"
-                    className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
-                    placeholder="-…"
-                  />
-                </div>
+                <div className="grid grid-rows-2 gap-3">
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Far Sell (+ {manualSellCcy})</div>
+                    <input
+                      value={farSellStr}
+                      onFocus={() => setActiveField("farSell")}
+                      onChange={(e) => {
+                        const raw = e.target.value.replace(/[^\d]/g, "");
+                        setFarSellStr(raw ? `+${formatWithCommasDigitsOnly(raw)}` : "");
+                      }}
+                      inputMode="numeric"
+                      className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
+                      placeholder="+…"
+                    />
+                  </div>
 
-                <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                  <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Far Buy (- {mBuy})</div>
-                  <input
-                    value={farBuyStr}
-                    onFocus={() => setActiveField("farBuy")}
-                    onChange={(e) => {
-                      const raw = e.target.value.replace(/[^\d]/g, "");
-                      setFarBuyStr(raw ? `-${formatWithCommasDigitsOnly(raw)}` : "");
-                    }}
-                    inputMode="numeric"
-                    className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
-                    placeholder="-…"
-                  />
-                </div>
-
-                <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                  <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Far Sell (+ {mSell})</div>
-                  <input
-                    value={farSellStr}
-                    onFocus={() => setActiveField("farSell")}
-                    onChange={(e) => {
-                      const raw = e.target.value.replace(/[^\d]/g, "");
-                      setFarSellStr(raw ? `+${formatWithCommasDigitsOnly(raw)}` : "");
-                    }}
-                    inputMode="numeric"
-                    className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
-                    placeholder="+…"
-                  />
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                    <div className="text-xs uppercase tracking-widest text-slate-700 font-bold">Far Buy (- {manualBuyCcy})</div>
+                    <input
+                      value={farBuyStr}
+                      onFocus={() => setActiveField("farBuy")}
+                      onChange={(e) => {
+                        const raw = e.target.value.replace(/[^\d]/g, "");
+                        setFarBuyStr(raw ? `-${formatWithCommasDigitsOnly(raw)}` : "");
+                      }}
+                      inputMode="numeric"
+                      className="mt-2 w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-slate-900 font-semibold"
+                      placeholder="-…"
+                    />
+                  </div>
                 </div>
               </div>
 
@@ -1733,69 +2026,13 @@ export default function Page() {
                 >
                   Execute
                 </button>
-
-                <div className="ml-auto text-sm font-semibold text-slate-700">
-                  {rates.status === "ok" ? (
-                    <>
-                      Spot (sell per buy):{" "}
-                      <span className="font-bold text-slate-900 ml-1">
-                        {(() => {
-                          const sp = spotFromUsdRates(mBuy, mSell, rates);
-                          return sp ? sp.toFixed(6) : "—";
-                        })()}
-                      </span>
-                    </>
-                  ) : (
-                    <span>Rates: {rates.status === "loading" ? "Loading…" : "Error"}</span>
-                  )}
-                </div>
               </div>
             </div>
 
             {costPanel}
+            <div>{fxRatesPanel}</div>
           </div>
         ) : null}
-
-        {/* Rates */}
-        <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
-          <div className="flex items-end justify-between gap-3">
-            <div>
-              <div className="text-lg font-semibold text-slate-900">FX Rates vs USD</div>
-              <div className="text-sm font-semibold text-slate-900">Source: frankfurter.app {rates.asOf ? `· As of ${rates.asOf}` : ""}</div>
-            </div>
-            <div className="text-sm font-semibold text-slate-900">
-              {rates.status === "loading" ? "Loading…" : rates.status === "error" ? `Error: ${rates.error}` : "Live"}
-            </div>
-          </div>
-
-          <div className="mt-4 overflow-auto rounded-2xl border border-slate-200">
-            <table className="w-full text-sm">
-              <thead className="bg-white">
-                <tr>
-                  <th className="text-left p-2 border-b border-slate-200 text-slate-900 font-semibold">CCY</th>
-                  <th className="text-right p-2 border-b border-slate-200 text-slate-900 font-semibold">1 USD =</th>
-                  <th className="text-right p-2 border-b border-slate-200 text-slate-900 font-semibold">1 CCY =</th>
-                </tr>
-              </thead>
-              <tbody>
-                {ratesList.map((r) => (
-                  <tr key={r.ccy} className="border-b border-slate-100 last:border-b-0">
-                    <td className="p-2 font-semibold text-slate-900">{r.ccy}</td>
-                    <td className="p-2 text-right font-semibold text-slate-900">
-                      {fmt4(r.cPerUsd)} {r.ccy}
-                    </td>
-                    <td className="p-2 text-right font-semibold text-slate-900">
-                      {fmt4(r.usdPerC)} USD
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="h-6" />
-          <div className="text-xs font-semibold text-slate-700">Note: Carry is a simplified interest-differential approximation using static IR assumptions.</div>
-        </div>
       </div>
     </div>
   );
