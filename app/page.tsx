@@ -5,65 +5,64 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 /**
  * FX Swaps Training Tool — Single-file Page (Next.js App Router)
  *
- * CHANGES (per request):
- * - Removed entire Home “Ask a question about forwards/swaps” section (and OpenAI key logic).
- * - Scenario generation: MXN/PHP/JPY can be large in native terms, but capped at ~100m USD-equivalent.
- * - Objective checks now use USD-equivalent for non-USD: within ±5m USD equiv (USD exempt).
- * - Basic: now runs as a “day game” with 15–30 suggestions, at least 4 “incorrect-to-execute” (i.e., Reject is correct).
- *   - No suggested trade > 100m USD-equivalent.
- *   - Always solvable within 30 suggestions (auto-plan regenerates each day).
- *   - If a bad suggestion is offered, the next suggestion uses a different currency pair.
- *   - When solved: modal “Well Done, the value date will now roll” -> OK -> rolls to next day and restarts.
- * - Guided:
- *   - 15 swaps per day.
- *   - Tile notional shows both currencies (buy amount + counter amount).
- *   - “Undo Last Trade” button (reverts last executed guided trade).
- *   - If a chosen tile worsens t+0 objective: prompt “This went the wrong way, execute a reversal?” Yes/No
- *     - Yes: reverts blotter, keeps the original cost entry, and logs a second “REVERSAL” trade; does NOT reduce swaps left further.
- * - Roll button label everywhere: “Roll Value Date”.
- * - Roll messages:
- *   - Basic auto-roll on solve (as above).
- *   - Guided rolls when swaps hit 0 with outcome messages:
- *     - Solved => “Well done, the value date will now roll”
- *     - All funded (all non-USD t+0 are long, but some > +5m USD equiv) => “Everything got funded, but we left idle cash on the table”
- *     - Else => “You ran out of time, the value date will now roll”
- *   - Manual roll uses same messages EXCEPT:
- *     - If out of range AND not all long => “We were short - Customer payments didn't go out, bad day at the office”
- * - Styling:
- *   - Page background set to Remitly-like navy.
- *   - Header text made white and added a simple inline “logo mark” before “Remitly Treasury”.
+ * Key rules (updated):
+ * - Objective (SOLVED): for EVERY non-USD currency, t+0 USD-equivalent must be LONG in [0 .. +5m].
+ *   - (So: no shorts, and no idle long > +5m USD-equivalent)
+ *   - MXN and PHP must be long (implicitly satisfied by the rule above; also stated explicitly in UI copy)
+ *
+ * Constraints / generation:
+ * - Blotter numbers are denominated in the CCY shown on the left (NOT USD).
+ * - But SOLVED checks and swap sizing limits use USD-equivalent.
+ * - For JPY/MXN/PHP: allow up to 100m USD-equivalent on generation/capping (so PHP/JPY can look “large” in local units).
+ *
+ * Basic game (updated):
+ * - Never offer swaps < 2m USD-equivalent or > 100m USD-equivalent.
+ * - “Swaps traded” counts ONLY correct executed trades (correct rejects do not count).
+ *
+ * Guided game (updated):
+ * - Always show exactly 4 tiles:
+ *    - 1 Best: solves one exposure into [0..5m] USD-equivalent long
+ *    - 1 Marginal: moves toward solution but ~50% as good
+ *    - 2 Worse: make positions worse
+ * - Always solvable within 15 swaps; after each execute, regenerate a fresh set of 4 tiles.
+ * - Has “Undo Last Trade” button (reverts last executed trade and removes it from the log).
+ * - When a swap clearly went the wrong way, offer “This went the wrong way, execute a reversal?” (Yes/No).
+ *   - If Yes: undo blotter impact, but keep original trade in cost tracker and add a “REVERSAL” trade entry. Does NOT refund swaps left.
+ *
+ * UI / branding (updated):
+ * - Dark navy background matching Remitly logo color (#212E61).
+ * - Header text is white; add a simple Remitly “R” mark (no ®).
+ * - Under-blotter rules text is white on all pages for legibility.
+ * - Remove “Clear preview” from cost tracker (it did nothing).
+ * - FX rates displayed as a cross-rate matrix (4dp, except MXN & PHP at 2dp).
  */
 
-/* ----------------------------- CCYs (alphabetical) ----------------------------- */
-
 type Ccy = string;
+
 // Alphabetical order (as requested for blotter). Removed SEK/NOK, added MXN/PHP.
 const CCYS: Ccy[] = ["AUD", "CAD", "CHF", "EUR", "GBP", "JPY", "MXN", "NZD", "PHP", "USD"];
 
 const HORIZON = 15; // t+0..t+14
 const MAX_DAYS = 80;
 
-const URGENT = 50_000_000;
-
-// Objective tolerance is USD-equivalent for non-USD
-const TOL_USD = 5_000_000;
-
+const TOL_USD_EQ = 5_000_000; // SOLVED upper bound in USD equivalent
 const USD_MIN_ROW_TOTAL = 300_000_000;
+
 const NONUSD_ROW_TOTAL_MIN = 1;
 const NONUSD_ROW_TOTAL_MAX = 10_000_000;
 
 const USD_BASE_LONG = 300_000_000;
 
-// Guided
-const GUIDED_STEPS_PER_DAY = 15;
+const BASIC_MAX_STEPS = 30;
+const BASIC_MIN_STEPS = 15;
+const BASIC_REQUIRED_BAD = 4;
 
-// Basic
-const BASIC_MIN_SUGGESTIONS = 15;
-const BASIC_MAX_SUGGESTIONS = 30;
-const BASIC_MIN_BAD_SUGGESTIONS = 4;
+const GUIDED_MAX_STEPS = 15;
 
-// Hard cap: no suggested trade > 100m USD-equivalent (near-leg USD value)
-const MAX_TRADE_USD_EQ = 100_000_000;
+const FWD_POINTS_SPREAD_BP = 1.5; // basis points
+
+// Remitly navy (from logo color extraction).
+const REMITLY_NAVY = "#212E61";
 
 // Simplified “static” IR assumptions (annualized).
 const IR: Record<Ccy, number> = {
@@ -77,21 +76,6 @@ const IR: Record<Ccy, number> = {
   NZD: 0.05,
   PHP: 0.065,
   USD: 0.05,
-};
-
-// Used ONLY for scenario generation caps before live rates load
-// (Approx USD per 1 unit of CCY)
-const APPROX_USD_PER_CCY: Record<Ccy, number> = {
-  USD: 1,
-  EUR: 1.08,
-  GBP: 1.27,
-  CHF: 1.12,
-  CAD: 0.74,
-  AUD: 0.66,
-  NZD: 0.61,
-  JPY: 0.0067,
-  MXN: 0.058,
-  PHP: 0.018,
 };
 
 function clamp(n: number, min: number, max: number) {
@@ -114,15 +98,20 @@ const nfInt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 function formatInt(n: number) {
   return nfInt.format(Math.round(n));
 }
+
 function formatM(n: number) {
   const sign = n < 0 ? "-" : "";
   const abs = Math.abs(n);
   const m = abs / 1_000_000;
   return `${sign}${m.toFixed(1)}m`;
 }
-function fmt4(n: number) {
-  return Number.isFinite(n) ? n.toFixed(4) : "—";
+
+function fmtRate(n: number, ccy: Ccy) {
+  // Show MXN & PHP to 2dp; others 4dp
+  const dp = ccy === "MXN" || ccy === "PHP" ? 2 : 4;
+  return Number.isFinite(n) ? n.toFixed(dp) : "—";
 }
+
 function formatWithCommasDigitsOnly(raw: string) {
   const digits = raw.replace(/[^\d]/g, "");
   if (!digits) return "";
@@ -134,9 +123,8 @@ function parseCommaNumber(s: string) {
 }
 
 function cellClass(v: number) {
-  const urgent = Math.abs(v) >= URGENT;
-  if (v > 0) return urgent ? "bg-emerald-300 text-emerald-950" : "bg-emerald-100 text-emerald-950";
-  if (v < 0) return urgent ? "bg-rose-300 text-rose-950" : "bg-rose-100 text-rose-950";
+  if (v > 0) return "bg-emerald-100 text-emerald-950";
+  if (v < 0) return "bg-rose-100 text-rose-950";
   return "bg-slate-50 text-slate-900";
 }
 
@@ -164,8 +152,6 @@ function cashflowView(s: Scenario): Record<Ccy, number[]> {
   return out;
 }
 
-// Forward points spread: 1.5bp applied to the forward points (widened against user).
-const FWD_POINTS_SPREAD_BP = 1.5; // basis points
 function forwardFromSpot(spot: number, buyCcy: Ccy, sellCcy: Ccy, days: number) {
   const T = clamp(days, 0, 3650) / 360;
   const rb = IR[buyCcy] ?? 0.03;
@@ -174,7 +160,6 @@ function forwardFromSpot(spot: number, buyCcy: Ccy, sellCcy: Ccy, days: number) 
   const theoFwd = (spot * (1 + rs * T)) / (1 + rb * T);
   const points = theoFwd - spot;
 
-  // Spread in “rate” terms (bps of spot). Apply in the direction that makes points less favourable.
   const spread = spot * (FWD_POINTS_SPREAD_BP / 10000);
   const widenedPoints = points === 0 ? spread : points + Math.sign(points) * spread;
 
@@ -211,6 +196,19 @@ function applyFxSwap(s: Scenario, t: SwapTrade): Scenario {
   applyAt(t.sellCcy, t.farOffset, +Math.round(t.notionalBuy * t.fwd));
 
   return out;
+}
+
+function invertTrade(t: SwapTrade): SwapTrade {
+  // opposite direction, same tenors and amounts
+  return {
+    buyCcy: t.sellCcy,
+    sellCcy: t.buyCcy,
+    notionalBuy: Math.round(t.notionalBuy * t.spot), // approximate: buy amount in opposite direction
+    nearOffset: t.nearOffset,
+    farOffset: t.farOffset,
+    spot: 1 / t.spot,
+    fwd: 1 / t.fwd,
+  };
 }
 
 function enforceRowTotals(s: Scenario): Scenario {
@@ -253,10 +251,7 @@ function rollValueDate(s: Scenario): Scenario {
     for (let d = 1; d < MAX_DAYS - 1; d++) out.flows[c][d] = out.flows[c][d + 1] ?? 0;
     out.flows[c][0] = 0;
 
-    // Keep day-to-day randomness, but allow big native for JPY/MXN/PHP within ~100m USD-equivalent
-    const usdPer = APPROX_USD_PER_CCY[c] ?? 1;
-    const maxNative = c === "JPY" || c === "MXN" || c === "PHP" ? Math.max(15_000_000, Math.round(MAX_TRADE_USD_EQ / usdPer)) : 15_000_000;
-    out.flows[c][MAX_DAYS - 1] = Math.round(rand(-maxNative, maxNative));
+    out.flows[c][MAX_DAYS - 1] = Math.round(rand(-15_000_000, 15_000_000));
   }
 
   return enforceRowTotals(out);
@@ -283,6 +278,7 @@ function makeEmptyRates(): UsdRates {
 }
 
 function spotFromUsdRates(buyCcy: Ccy, sellCcy: Ccy, rates: UsdRates) {
+  // returns sell per buy
   if (buyCcy === sellCcy) return 1;
   const ub = rates.usdPerCcy[buyCcy];
   const us = rates.usdPerCcy[sellCcy];
@@ -301,61 +297,47 @@ function swapUsdCost(trade: { notionalBuy: number; spot: number; fwd: number; se
   return toUsd(diffSell, trade.sellCcy, rates);
 }
 
-/* ----------------------------- Objective helpers (USD equiv) ----------------------------- */
+/* ----------------------------- Objective helpers (USD-equivalent) ----------------------------- */
 
-function nonUsdSquaredAtT0UsdEq(bal: Record<Ccy, number>, rates: UsdRates) {
-  if (rates.status !== "ok") return false;
+function usdEqT0(bal: Record<Ccy, number>, rates: UsdRates): Record<Ccy, number> {
+  const out: Record<Ccy, number> = {} as any;
+  for (const c of CCYS) out[c] = toUsd(bal[c] ?? 0, c, rates);
+  return out;
+}
+
+function solvedT0Long0to5mUsdEq(bal: Record<Ccy, number>, rates: UsdRates) {
+  // Non-USD must be LONG and between 0 and +5m USD eq.
   for (const c of CCYS) {
     if (c === "USD") continue;
-    const usdEq = toUsd(bal[c] ?? 0, c, rates);
-    if (!Number.isFinite(usdEq)) return false;
-    if (Math.abs(usdEq) > TOL_USD) return false;
+    const u = toUsd(bal[c] ?? 0, c, rates);
+    if (!Number.isFinite(u)) return false;
+    if (u < 0) return false;
+    if (u > TOL_USD_EQ) return false;
   }
   return true;
 }
 
-function allNonUsdLongButSomeIdle(bal: Record<Ccy, number>, rates: UsdRates) {
-  if (rates.status !== "ok") return false;
-  let anyIdle = false;
-  for (const c of CCYS) {
-    if (c === "USD") continue;
-    const usdEq = toUsd(bal[c] ?? 0, c, rates);
-    if (!Number.isFinite(usdEq)) return false;
-    if (usdEq < -TOL_USD) return false; // short
-    if (usdEq > TOL_USD) anyIdle = true; // long beyond range
-  }
-  return anyIdle; // all non-USD are not short, and at least one too long
-}
-
-function t0ErrorUsdL1(bal: Record<Ccy, number>, rates: UsdRates) {
-  if (rates.status !== "ok") return Number.POSITIVE_INFINITY;
+function t0BadnessUsdEq(bal: Record<Ccy, number>, rates: UsdRates) {
+  // Lower is better. Penalize shorts heavily + excess idle cash.
   let e = 0;
   for (const c of CCYS) {
     if (c === "USD") continue;
-    const usdEq = toUsd(bal[c] ?? 0, c, rates);
-    if (!Number.isFinite(usdEq)) return Number.POSITIVE_INFINITY;
-    const v = Math.abs(usdEq);
-    if (v > TOL_USD) e += v - TOL_USD;
+    const u = toUsd(bal[c] ?? 0, c, rates);
+    if (!Number.isFinite(u)) continue;
+    if (u < 0) e += Math.abs(u) * 2;
+    if (u > TOL_USD_EQ) e += u - TOL_USD_EQ;
   }
   return e;
 }
 
-/* ----------------------------- Scenario generation ----------------------------- */
+/* ----------------------------- Scenario generation + capping ----------------------------- */
 
-function maxNativeForUsdCap(ccy: Ccy, usdCap: number) {
-  const usdPer = APPROX_USD_PER_CCY[ccy] ?? 1;
-  if (!Number.isFinite(usdPer) || usdPer <= 0) return usdCap;
-  return Math.round(usdCap / usdPer);
-}
-
-function generateGuidedSolvableScenario(): Scenario {
+function generateScenarioRaw(): Scenario {
   const balances: Record<Ccy, number> = {} as any;
   const flows: Record<Ccy, number[]> = {} as any;
 
   for (const c of CCYS) {
-    // Default range is “native” and can be large for JPY/MXN/PHP (<=100m USD-equiv)
-    const maxNative = c === "JPY" || c === "MXN" || c === "PHP" ? maxNativeForUsdCap(c, 100_000_000) : 80_000_000;
-    balances[c] = Math.round(rand(-maxNative, maxNative));
+    balances[c] = Math.round(rand(-80_000_000, 80_000_000));
     flows[c] = Array.from({ length: MAX_DAYS }, () => 0);
     flows[c][0] = 0;
   }
@@ -364,396 +346,316 @@ function generateGuidedSolvableScenario(): Scenario {
 
   for (let d = 1; d < MAX_DAYS; d++) {
     for (const c of CCYS) {
-      const maxNative = c === "JPY" || c === "MXN" || c === "PHP" ? maxNativeForUsdCap(c, 35_000_000) : 20_000_000;
-      flows[c][d] += Math.round(rand(-maxNative, maxNative));
-      if (Math.random() < 0.2) {
-        const bump = c === "JPY" || c === "MXN" || c === "PHP" ? maxNativeForUsdCap(c, 80_000_000) : 80_000_000;
-        flows[c][d] += Math.round(rand(-bump, bump));
-      }
-      if (Math.random() < 0.06) {
-        const bump = c === "JPY" || c === "MXN" || c === "PHP" ? maxNativeForUsdCap(c, 100_000_000) : 120_000_000;
-        flows[c][d] += Math.round(rand(-bump, bump));
-      }
+      flows[c][d] += Math.round(rand(-20_000_000, 20_000_000));
+      if (Math.random() < 0.2) flows[c][d] += Math.round(rand(-80_000_000, 80_000_000));
+      if (Math.random() < 0.06) flows[c][d] += Math.round(rand(-120_000_000, 120_000_000));
     }
-  }
-
-  const nonUsd = CCYS.filter((c) => c !== "USD");
-  const offCount = Math.floor(rand(6, 9));
-  const off = [...nonUsd].sort(() => Math.random() - 0.5).slice(0, offCount);
-  const nearZero = nonUsd.filter((c) => !off.includes(c));
-
-  for (const c of nearZero) {
-    const maxNative = maxNativeForUsdCap(c, 5_000_000); // keep near-zero within ~5m USD eq range
-    balances[c] = Math.round(rand(-maxNative, maxNative));
-  }
-  for (const c of off) {
-    const sign = Math.random() < 0.5 ? -1 : 1;
-    const maxNative = maxNativeForUsdCap(c, 100_000_000);
-    const mag = Math.round(rand(maxNativeForUsdCap(c, 20_000_000), maxNative) / 1_000_000) * 1_000_000;
-    balances[c] = sign * mag;
   }
 
   return enforceRowTotals({ balances, flows });
 }
 
-/* ----------------------------- Guided ----------------------------- */
+function capScenarioToUsdEq(s: Scenario, rates: UsdRates): Scenario {
+  // Cap t+0 USD-equivalent sizes so JPY/MXN/PHP can be bigger (up to 100m USD eq), others ~80m.
+  const out = shallowCopyScenario(s);
+  if (rates.status !== "ok") return out;
+
+  const capUsdEqFor = (c: Ccy) => {
+    if (c === "USD") return Infinity;
+    return c === "JPY" || c === "MXN" || c === "PHP" ? 100_000_000 : 80_000_000;
+  };
+
+  for (const c of CCYS) {
+    const cap = capUsdEqFor(c);
+    const u = toUsd(out.balances[c] ?? 0, c, rates);
+    if (!Number.isFinite(u) || cap === Infinity) continue;
+    if (Math.abs(u) <= cap) continue;
+
+    const scale = cap / Math.abs(u);
+    out.balances[c] = Math.round((out.balances[c] ?? 0) * scale);
+  }
+
+  return out;
+}
+
+/* ----------------------------- Sizing helpers (min 2m / max 100m USD eq) ----------------------------- */
+
+const MIN_SWAP_USD_EQ = 2_000_000;
+const MAX_SWAP_USD_EQ = 100_000_000;
+
+function clampNotionalBuyToUsdEq(t: SwapTrade, rates: UsdRates): SwapTrade | null {
+  if (rates.status !== "ok") return t;
+
+  const u = toUsd(t.notionalBuy, t.buyCcy, rates);
+  if (!Number.isFinite(u) || u <= 0) return null;
+
+  if (u < MIN_SWAP_USD_EQ) {
+    const factor = MIN_SWAP_USD_EQ / u;
+    const nb = Math.round(t.notionalBuy * factor);
+    return { ...t, notionalBuy: nb };
+  }
+  if (u > MAX_SWAP_USD_EQ) {
+    const factor = MAX_SWAP_USD_EQ / u;
+    const nb = Math.round(t.notionalBuy * factor);
+    return { ...t, notionalBuy: nb };
+  }
+  return t;
+}
+
+/* ----------------------------- Basic planner (pre-built solvable list) ----------------------------- */
+
+type BasicSuggestion = SwapTrade & {
+  id: string;
+  isGood: boolean; // good => correct action is EXECUTE. bad => correct action is REJECT.
+  usdCost: number | null;
+};
+
+function makeSwapVsUsdToTargetOneCcy(
+  s: Scenario,
+  rates: UsdRates,
+  ccy: Ccy,
+  targetUsdEq: number, // between 0..5m
+  farOffset: number
+): SwapTrade | null {
+  if (ccy === "USD") return null;
+  const curUsd = toUsd(s.balances[ccy] ?? 0, ccy, rates);
+  if (!Number.isFinite(curUsd)) return null;
+
+  const deltaUsd = targetUsdEq - curUsd; // if positive => need more long (buy ccy)
+  const nearOffset = 0;
+  const sellCcy = "USD";
+  let buyCcy: Ccy;
+  let notionalBuy: number;
+
+  if (deltaUsd >= 0) {
+    buyCcy = ccy;
+    const usdPer = rates.usdPerCcy[ccy];
+    if (!Number.isFinite(usdPer) || usdPer <= 0) return null;
+    notionalBuy = Math.round(deltaUsd / usdPer);
+  } else {
+    // reduce long / fix short: buy USD, sell ccy
+    buyCcy = "USD";
+    sellCcy;
+    // we want to SELL ccy on near, which means buy USD / sell ccy
+    const wantReduceUsd = Math.abs(deltaUsd);
+    notionalBuy = Math.round(wantReduceUsd); // notionalBuy in USD
+  }
+
+  const buy = buyCcy;
+  const sell = buyCcy === "USD" ? ccy : "USD";
+  const sp = spotFromUsdRates(buy, sell, rates);
+  if (!sp) return null;
+  const fw = forwardFromSpot(sp, buy, sell, Math.max(1, farOffset - nearOffset));
+
+  const t: SwapTrade = {
+    buyCcy: buy,
+    sellCcy: sell,
+    notionalBuy,
+    nearOffset,
+    farOffset,
+    spot: sp,
+    fwd: fw,
+  };
+
+  return clampNotionalBuyToUsdEq(t, rates);
+}
+
+function makeBadSwapDifferentPair(s: Scenario, rates: UsdRates, avoidPair: string | null): SwapTrade | null {
+  const farOffset = Math.random() < 0.7 ? 2 : pickOne([3, 5, 7]);
+  const nearOffset = 0;
+
+  const allPairs: Array<[Ccy, Ccy]> = [];
+  for (const a of CCYS) for (const b of CCYS) if (a !== b) allPairs.push([a, b]);
+
+  const shuffled = [...allPairs].sort(() => Math.random() - 0.5);
+  for (const [buyCcy, sellCcy] of shuffled) {
+    const pairKey = `${buyCcy}/${sellCcy}`;
+    if (avoidPair && pairKey === avoidPair) continue;
+
+    const sp = spotFromUsdRates(buyCcy, sellCcy, rates) ?? 1;
+    const fw = forwardFromSpot(sp, buyCcy, sellCcy, Math.max(1, farOffset - nearOffset));
+
+    // choose notional so it's within [2m..100m] USD eq (based on buy ccy)
+    const usdPer = rates.usdPerCcy[buyCcy];
+    if (!Number.isFinite(usdPer) || usdPer <= 0) continue;
+    const targetUsd = rand(MIN_SWAP_USD_EQ, Math.min(25_000_000, MAX_SWAP_USD_EQ));
+    const notionalBuy = Math.round(targetUsd / usdPer);
+
+    const t: SwapTrade = { buyCcy, sellCcy, notionalBuy, nearOffset, farOffset, spot: sp, fwd: fw };
+    const clamped = clampNotionalBuyToUsdEq(t, rates);
+    if (!clamped) continue;
+
+    // ensure it is "bad" by checking it worsens badness
+    const after = applyFxSwap(s, clamped);
+    if (t0BadnessUsdEq(after.balances, rates) > t0BadnessUsdEq(s.balances, rates)) return clamped;
+  }
+
+  return null;
+}
+
+function buildBasicPlanForDay(startScenario: Scenario, rates: UsdRates): BasicSuggestion[] {
+  // Plan: create a sequence that becomes SOLVED if user executes all good and rejects all bad.
+  // Ensure at least BASIC_REQUIRED_BAD bad suggestions, and length between [15..30].
+  const plan: BasicSuggestion[] = [];
+  let s = shallowCopyScenario(startScenario);
+
+  const farChoices = [2, 3, 5, 7];
+
+  // 1) sprinkle bad suggestions early and ensure different pairs each time
+  let lastBadPair: string | null = null;
+  for (let i = 0; i < BASIC_REQUIRED_BAD; i++) {
+    const bad = makeBadSwapDifferentPair(s, rates, lastBadPair);
+    if (!bad) break;
+    lastBadPair = `${bad.buyCcy}/${bad.sellCcy}`;
+    const usdC = swapUsdCost({ notionalBuy: bad.notionalBuy, spot: bad.spot, fwd: bad.fwd, sellCcy: bad.sellCcy }, rates);
+    plan.push({ id: id(), ...bad, isGood: false, usdCost: Number.isFinite(usdC) ? usdC : null });
+  }
+
+  // 2) solve each currency vs USD as needed
+  // iterate worst-first until solved or hit max
+  const targetMid = 2_500_000;
+  for (let guard = 0; guard < 200; guard++) {
+    if (plan.length >= BASIC_MAX_STEPS) break;
+    if (solvedT0Long0to5mUsdEq(s.balances, rates)) break;
+
+    const nonUsd = CCYS.filter((c) => c !== "USD");
+    const scores = nonUsd
+      .map((c) => ({ c, u: toUsd(s.balances[c] ?? 0, c, rates) }))
+      .filter((x) => Number.isFinite(x.u))
+      .map((x) => {
+        const u = x.u as number;
+        const bad = u < 0 ? Math.abs(u) * 2 : u > TOL_USD_EQ ? u - TOL_USD_EQ : 0;
+        return { c: x.c, u, bad };
+      })
+      .sort((a, b) => b.bad - a.bad);
+
+    const pick = scores[0];
+    if (!pick || pick.bad <= 0) break;
+
+    const far = pickOne(farChoices);
+    const t = makeSwapVsUsdToTargetOneCcy(s, rates, pick.c, clamp(targetMid, 0, TOL_USD_EQ), far);
+    if (!t) break;
+
+    // Ensure isGood (actually improves)
+    const after = applyFxSwap(s, t);
+    if (t0BadnessUsdEq(after.balances, rates) >= t0BadnessUsdEq(s.balances, rates)) {
+      // if it didn't improve (edge case), try a different far
+      continue;
+    }
+
+    const usdC = swapUsdCost({ notionalBuy: t.notionalBuy, spot: t.spot, fwd: t.fwd, sellCcy: t.sellCcy }, rates);
+    plan.push({ id: id(), ...t, isGood: true, usdCost: Number.isFinite(usdC) ? usdC : null });
+
+    // simulate the “correct” path: good trades get executed
+    s = after;
+  }
+
+  // 3) pad with extra “bad” suggestions to reach BASIC_MIN_STEPS (they should be rejected)
+  let avoid = lastBadPair;
+  while (plan.length < BASIC_MIN_STEPS && plan.length < BASIC_MAX_STEPS) {
+    const bad = makeBadSwapDifferentPair(s, rates, avoid);
+    if (!bad) break;
+    avoid = `${bad.buyCcy}/${bad.sellCcy}`;
+    const usdC = swapUsdCost({ notionalBuy: bad.notionalBuy, spot: bad.spot, fwd: bad.fwd, sellCcy: bad.sellCcy }, rates);
+    plan.push({ id: id(), ...bad, isGood: false, usdCost: Number.isFinite(usdC) ? usdC : null });
+  }
+
+  // 4) hard cap to max
+  return plan.slice(0, BASIC_MAX_STEPS);
+}
+
+/* ----------------------------- Guided (4 tiles) ----------------------------- */
 
 type GuidedTile = SwapTrade & {
   id: string;
   category: "Best" | "Marginal" | "Worse";
-  scoreDelta: number;
+  scoreDelta: 10 | 5 | -5;
   why: string;
   usdCost: number | null;
+  counterAmountLabel: string; // e.g. "≈ 31.2m USD"
 };
+
+function makeGuidedTile(rates: UsdRates, t: SwapTrade, category: GuidedTile["category"], scoreDelta: GuidedTile["scoreDelta"], why: string): GuidedTile {
+  const usdC = swapUsdCost({ notionalBuy: t.notionalBuy, spot: t.spot, fwd: t.fwd, sellCcy: t.sellCcy }, rates);
+  const counterNear = Math.round(t.notionalBuy * t.spot); // sellCcy amount (abs) on near
+  const counterLabel = `${formatM(counterNear)} ${t.sellCcy}`;
+  return {
+    id: id(),
+    ...t,
+    category,
+    scoreDelta,
+    why,
+    usdCost: Number.isFinite(usdC) ? usdC : null,
+    counterAmountLabel: counterLabel,
+  };
+}
 
 function pickWorstNonUsdByUsdEq(bal: Record<Ccy, number>, rates: UsdRates) {
-  let worstCcy: Ccy | null = null;
-  let worstAbs = -1;
-  let value = 0;
+  let best: { c: Ccy; bad: number; u: number } | null = null;
   for (const c of CCYS) {
     if (c === "USD") continue;
-    const usdEq = toUsd(bal[c] ?? 0, c, rates);
-    if (!Number.isFinite(usdEq)) continue;
-    const a = Math.abs(usdEq);
-    if (a > worstAbs) {
-      worstAbs = a;
-      worstCcy = c;
-      value = bal[c] ?? 0;
-    }
+    const u = toUsd(bal[c] ?? 0, c, rates);
+    if (!Number.isFinite(u)) continue;
+    const bad = u < 0 ? Math.abs(u) * 2 : u > TOL_USD_EQ ? u - TOL_USD_EQ : 0;
+    if (!best || bad > best.bad) best = { c, bad, u };
   }
-  return { ccy: worstCcy, value };
+  return best;
 }
 
-function capTradeToUsd(t: SwapTrade, rates: UsdRates): SwapTrade {
-  // Cap near-leg USD-equivalent based on buy-ccy notional (buy amount in buyCcy -> USD)
-  const usdEq = Math.abs(toUsd(t.notionalBuy, t.buyCcy, rates));
-  if (!Number.isFinite(usdEq) || usdEq <= MAX_TRADE_USD_EQ) return t;
-  const scale = MAX_TRADE_USD_EQ / usdEq;
-  return { ...t, notionalBuy: Math.max(1, Math.round(t.notionalBuy * scale)) };
-}
+function buildGuidedFourTiles(s: Scenario, rates: UsdRates): GuidedTile[] {
+  const farOffset = 2;
+  const targetMid = 2_500_000;
 
-function makeUsdFixTradeForCcy(s: Scenario, rates: UsdRates, ccy: Ccy, farOffset: number): SwapTrade | null {
-  if (rates.status !== "ok") return null;
-  if (ccy === "USD") return null;
+  const worst = pickWorstNonUsdByUsdEq(s.balances, rates);
+  const focus = worst?.c ?? "EUR";
 
-  const balC = s.balances[ccy] ?? 0;
-  const usdEq = toUsd(balC, ccy, rates);
-  if (!Number.isFinite(usdEq)) return null;
+  // BEST: bring focus into [0..5m] (aim ~2.5m)
+  const bestTrade = makeSwapVsUsdToTargetOneCcy(s, rates, focus, clamp(targetMid, 0, TOL_USD_EQ), farOffset);
 
-  if (Math.abs(usdEq) <= TOL_USD) return null;
-
-  // Amount in CCY that corresponds to the USD tolerance
-  const tolInCcy = TOL_USD / (rates.usdPerCcy[ccy] || 1);
-
-  // We’ll aim to move at least 50% closer (or fully into range if possible) on THIS currency
-  const excess = Math.max(0, Math.abs(balC) - tolInCcy);
-  const targetMove = clamp(excess, excess * 0.5, excess); // >=50% of excess
-  const move = Math.max(1, Math.round(targetMove));
-
-  const nearOffset = 0;
-  if (balC < 0) {
-    // short CCY => buy CCY / sell USD
-    const sp = spotFromUsdRates(ccy, "USD", rates);
-    if (!sp) return null;
-    const fw = forwardFromSpot(sp, ccy, "USD", Math.max(1, farOffset - nearOffset));
-    const t: SwapTrade = { buyCcy: ccy, sellCcy: "USD", notionalBuy: move, nearOffset, farOffset, spot: sp, fwd: fw };
-    return capTradeToUsd(t, rates);
-  } else {
-    // long CCY => sell CCY / buy USD (swap representation buys USD)
-    const sp = spotFromUsdRates("USD", ccy, rates);
-    if (!sp) return null; // sellCcy per buyCcy (ccy per USD)
-    const fw = forwardFromSpot(sp, "USD", ccy, Math.max(1, farOffset - nearOffset));
-
-    // We want to SELL 'move' CCY on near. In our representation, nearSell = notionalBuy * spot (CCY).
-    // So choose notionalBuy (USD) = move / spot.
-    const notionalUsd = Math.max(1, Math.round(move / sp));
-    const t: SwapTrade = { buyCcy: "USD", sellCcy: ccy, notionalBuy: notionalUsd, nearOffset, farOffset, spot: sp, fwd: fw };
-    return capTradeToUsd(t, rates);
-  }
-}
-
-function makeTileFactory(rates: UsdRates) {
-  return (
-    buyCcy: Ccy,
-    sellCcy: Ccy,
-    notionalBuy: number,
-    nearOffset: number,
-    farOffset: number,
-    category: GuidedTile["category"],
-    scoreDelta: GuidedTile["scoreDelta"],
-    why: string
-  ): GuidedTile => {
-    const sp = spotFromUsdRates(buyCcy, sellCcy, rates) ?? Number(rand(0.6, 1.8).toFixed(6));
-    const fw = forwardFromSpot(sp, buyCcy, sellCcy, Math.max(1, farOffset - nearOffset));
-    const usdC = swapUsdCost({ notionalBuy, spot: sp, fwd: fw, sellCcy }, rates);
-    const capped = capTradeToUsd(
-      {
-        buyCcy,
-        sellCcy,
-        notionalBuy: Math.round(notionalBuy),
-        nearOffset,
-        farOffset,
-        spot: sp,
-        fwd: fw,
-      },
-      rates
-    );
-    const usdC2 = swapUsdCost({ notionalBuy: capped.notionalBuy, spot: capped.spot, fwd: capped.fwd, sellCcy: capped.sellCcy }, rates);
-
-    return {
-      id: id(),
-      ...capped,
-      category,
-      scoreDelta,
-      why,
-      usdCost: Number.isFinite(usdC2) ? usdC2 : null,
-    };
+  // If for some reason we can't, fall back to a random USD pair
+  const fallback = () => {
+    const buyCcy = pickOne(CCYS.filter((c) => c !== "USD"));
+    const sellCcy = "USD";
+    const sp = spotFromUsdRates(buyCcy, sellCcy, rates) ?? 1;
+    const fw = forwardFromSpot(sp, buyCcy, sellCcy, farOffset);
+    const usdPer = rates.usdPerCcy[buyCcy];
+    const notionalBuy = Math.round(10_000_000 / (usdPer || 1));
+    return clampNotionalBuyToUsdEq({ buyCcy, sellCcy, notionalBuy, nearOffset: 0, farOffset, spot: sp, fwd: fw }, rates);
   };
-}
 
-function generateGuidedTiles(s: Scenario, rates: UsdRates): GuidedTile[] {
-  const makeTile = makeTileFactory(rates);
-  const bal = s.balances;
+  const best = bestTrade ?? fallback();
+  if (!best) return [];
 
-  if (rates.status !== "ok") return [];
-
-  // Build “always solvable” set:
-  // - 4 strong fixes: top 4 worst currencies vs USD, sized to move >=50% closer (or into range)
-  // - 2 marginals: smaller fixes on next worst
-  // - 2 worses: random (still capped)
-  const nonUsd = CCYS.filter((c) => c !== "USD");
-
-  const ranked = nonUsd
-    .map((c) => ({ c, usdAbs: Math.abs(toUsd(bal[c] ?? 0, c, rates) || 0) }))
-    .sort((a, b) => b.usdAbs - a.usdAbs);
-
-  const farSolve = 2;
-  const farFuture = pickOne([5, 7, 10, 14]);
-
-  const bests: GuidedTile[] = [];
-  for (const item of ranked.slice(0, 4)) {
-    const c = item.c;
-    const t = makeUsdFixTradeForCcy(s, rates, c, farSolve) ?? makeUsdFixTradeForCcy(s, rates, c, farFuture);
-    if (!t) continue;
-
-    const before = t0ErrorUsdL1(s.balances, rates);
-    const after = t0ErrorUsdL1(applyFxSwap(s, t).balances, rates);
-    const improves = after < before;
-
-    bests.push(
-      makeTile(
-        t.buyCcy,
-        t.sellCcy,
-        t.notionalBuy,
-        t.nearOffset,
-        t.farOffset,
-        "Best",
-        7,
-        improves
-          ? `Targets ${c} at t+0: moves it at least ~50% closer to ±$5m USD-equiv (far leg t+${t.farOffset}).`
-          : `Targets ${c} at t+0 (capped): should materially reduce the biggest imbalance.`
-      )
-    );
-  }
-
-  // Marginals: smaller moves for next two
-  const marginals: GuidedTile[] = [];
-  for (const item of ranked.slice(4, 6)) {
-    const c = item.c;
-    const base = makeUsdFixTradeForCcy(s, rates, c, pickOne([2, 3, 5])) ?? makeUsdFixTradeForCcy(s, rates, c, pickOne([7, 10]));
-    if (!base) continue;
-    const smaller = { ...base, notionalBuy: Math.max(1, Math.round(base.notionalBuy * 0.6)) };
-    marginals.push(
-      makeTile(
-        smaller.buyCcy,
-        smaller.sellCcy,
-        smaller.notionalBuy,
-        smaller.nearOffset,
-        smaller.farOffset,
-        "Marginal",
-        3,
-        `Marginal: helps ${c} but may not be the fastest path to fully square today.`
-      )
-    );
-  }
-
-  // Worse tiles (random, capped)
-  const worses: GuidedTile[] = [];
-  const randomPair = () => {
-    const buy = pickOne(CCYS);
-    let sell = pickOne(CCYS);
-    if (sell === buy) sell = pickOne(CCYS.filter((x) => x !== buy));
-    return { buy, sell };
+  // MARGINAL: ~half size in same direction
+  const marginal: SwapTrade = {
+    ...best,
+    notionalBuy: Math.max(1, Math.round(best.notionalBuy * 0.5)),
   };
-  for (let i = 0; i < 2; i++) {
-    const { buy, sell } = randomPair();
-    const far = pickOne([2, 3, 5, 7, 10]);
-    const n = i === 0 ? 0 : 1;
-    const sp = spotFromUsdRates(buy, sell, rates) ?? 1;
-    const fw = forwardFromSpot(sp, buy, sell, Math.max(1, far - n));
-    const raw: SwapTrade = { buyCcy: buy, sellCcy: sell, notionalBuy: Math.round(rand(15_000_000, 90_000_000)), nearOffset: n, farOffset: far, spot: sp, fwd: fw };
-    const capped = capTradeToUsd(raw, rates);
-    worses.push(makeTile(capped.buyCcy, capped.sellCcy, capped.notionalBuy, capped.nearOffset, capped.farOffset, "Worse", -3, `Worse: likely to worsen today’s t+0 objective.`));
-  }
+  const marginalClamped = clampNotionalBuyToUsdEq(marginal, rates) ?? marginal;
 
-  const tiles = [...bests, ...marginals, ...worses].slice(0, 8);
+  // WORSE 1: opposite direction same pair similar size
+  const worse1Base: SwapTrade = {
+    ...best,
+    buyCcy: best.sellCcy,
+    sellCcy: best.buyCcy,
+    notionalBuy: best.notionalBuy,
+    spot: 1 / best.spot,
+    fwd: 1 / best.fwd,
+  };
+  const worse1 = clampNotionalBuyToUsdEq(worse1Base, rates) ?? worse1Base;
 
-  // If we got too few tiles (rare), pad with safe USD fixes
-  while (tiles.length < 8 && ranked.length) {
-    const c = ranked[tiles.length % ranked.length].c;
-    const t = makeUsdFixTradeForCcy(s, rates, c, 2);
-    if (!t) break;
-    tiles.push(makeTile(t.buyCcy, t.sellCcy, t.notionalBuy, t.nearOffset, t.farOffset, "Best", 7, `Targets ${c} (pad).`));
-  }
+  // WORSE 2: another bad trade (different pair) if possible
+  const worse2Trade = makeBadSwapDifferentPair(s, rates, `${worse1.buyCcy}/${worse1.sellCcy}`) ?? worse1;
 
+  const tiles: GuidedTile[] = [
+    makeGuidedTile(rates, best, "Best", 10, `Best: solves ${focus} funding into the target range on t+0 (USD-equivalent).`),
+    makeGuidedTile(rates, marginalClamped, "Marginal", 5, `Marginal: moves ${focus} toward target, but only ~half as effective as Best.`),
+    makeGuidedTile(rates, worse1, "Worse", -5, `Worse: pushes ${focus} away from target (wrong-way direction).`),
+    makeGuidedTile(rates, worse2Trade, "Worse", -5, `Worse: increases today’s funding risk versus the objective.`),
+  ];
+
+  // shuffle so Best isn't always in same position
   return tiles.sort(() => Math.random() - 0.5);
-}
-
-/* ----------------------------- Basic (planned day set) ----------------------------- */
-
-type BasicSuggestion = SwapTrade & {
-  id: string;
-  isGood: boolean; // hidden from user, only used for scoring logic
-  usdCost: number | null;
-};
-
-function pairKey(buy: Ccy, sell: Ccy) {
-  return `${buy}/${sell}`;
-}
-
-function invertTrade(t: SwapTrade, rates: UsdRates): SwapTrade | null {
-  // Invert to create an “incorrect-to-execute” suggestion (i.e., likely worse)
-  // Use inverse spot/fwd, and use near sell amount as the new buy notional.
-  const nearSellAbs = Math.abs(Math.round(t.notionalBuy * t.spot));
-  const invSpot = t.spot !== 0 ? 1 / t.spot : spotFromUsdRates(t.sellCcy, t.buyCcy, rates) ?? 1;
-  const invFwd = t.fwd !== 0 ? 1 / t.fwd : forwardFromSpot(invSpot, t.sellCcy, t.buyCcy, Math.max(1, t.farOffset - t.nearOffset));
-  const inv: SwapTrade = {
-    buyCcy: t.sellCcy,
-    sellCcy: t.buyCcy,
-    notionalBuy: Math.max(1, nearSellAbs),
-    nearOffset: t.nearOffset,
-    farOffset: t.farOffset,
-    spot: invSpot,
-    fwd: invFwd,
-  };
-  return capTradeToUsd(inv, rates);
-}
-
-function buildBasicPlan(s0: Scenario, rates: UsdRates) {
-  if (rates.status !== "ok") return { suggestions: [] as BasicSuggestion[], totalPlanned: 0 };
-
-  const totalPlanned = Math.floor(rand(BASIC_MIN_SUGGESTIONS, BASIC_MAX_SUGGESTIONS + 1));
-  const needBad = BASIC_MIN_BAD_SUGGESTIONS;
-
-  // Start from s0 and plan sequentially: mostly “good” USD fixes, with injected “bad” suggestions.
-  let working = shallowCopyScenario(s0);
-
-  const suggestions: BasicSuggestion[] = [];
-  const badSlots = new Set<number>();
-
-  // Spread bad suggestions across the plan (not first 2, not last 2)
-  while (badSlots.size < needBad) {
-    const idx = Math.floor(rand(2, Math.max(3, totalPlanned - 2)));
-    badSlots.add(idx);
-  }
-
-  let lastPair: string | null = null;
-  let lastWasBad = false;
-
-  for (let i = 0; i < totalPlanned; i++) {
-    // If already solved early, still fill the remaining with small random-but-capped “bad” (so you can keep playing),
-    // but we will auto-roll as soon as the user gets solved in live play.
-    const far = Math.random() < 0.8 ? 2 : pickOne([3, 5, 7]);
-
-    // Choose target worst currency
-    const worst = pickWorstNonUsdByUsdEq(working.balances, rates);
-    const c = worst.ccy ?? pickOne(CCYS.filter((x) => x !== "USD"));
-
-    let good = makeUsdFixTradeForCcy(working, rates, c, far);
-
-    // If couldn't build, fallback to random safe trade
-    if (!good) {
-      const buy = pickOne(CCYS);
-      let sell = pickOne(CCYS);
-      if (sell === buy) sell = pickOne(CCYS.filter((x) => x !== buy));
-      const sp = spotFromUsdRates(buy, sell, rates) ?? 1;
-      const fw = forwardFromSpot(sp, buy, sell, Math.max(1, far));
-      good = capTradeToUsd({ buyCcy: buy, sellCcy: sell, notionalBuy: Math.round(rand(10_000_000, 60_000_000)), nearOffset: 0, farOffset: far, spot: sp, fwd: fw }, rates);
-    }
-
-    // Enforce pair switch after a bad suggestion
-    const wantBad = badSlots.has(i);
-
-    let trade: SwapTrade = good;
-    if (wantBad) {
-      const inv = invertTrade(good, rates);
-      if (inv) trade = inv;
-    }
-
-    // If last was bad, force different pair for THIS one (and generally avoid repeats)
-    const thisPair = pairKey(trade.buyCcy, trade.sellCcy);
-    if ((lastWasBad && lastPair && thisPair === lastPair) || (lastPair && thisPair === lastPair)) {
-      // Try to switch by flipping against USD for worst currency
-      const altC = c === "USD" ? "EUR" : c;
-      const alt = makeUsdFixTradeForCcy(working, rates, altC, far) ?? good;
-      const altPair = pairKey(alt.buyCcy, alt.sellCcy);
-      if (altPair !== lastPair) {
-        trade = wantBad ? invertTrade(alt, rates) ?? trade : alt;
-      }
-    }
-
-    const beforeErr = t0ErrorUsdL1(working.balances, rates);
-    const afterScenario = applyFxSwap(working, trade);
-    const afterErr = t0ErrorUsdL1(afterScenario.balances, rates);
-    const isGood = afterErr < beforeErr;
-
-    const usdC = swapUsdCost({ notionalBuy: trade.notionalBuy, spot: trade.spot, fwd: trade.fwd, sellCcy: trade.sellCcy }, rates);
-
-    suggestions.push({
-      id: id(),
-      ...trade,
-      isGood,
-      usdCost: Number.isFinite(usdC) ? usdC : null,
-    });
-
-    // Only advance the working scenario with “good” trades so the plan remains solvable even if user rejects bad ones
-    if (!wantBad) {
-      working = afterScenario;
-    }
-
-    lastPair = pairKey(trade.buyCcy, trade.sellCcy);
-    lastWasBad = wantBad;
-  }
-
-  // Ensure at least 4 bad suggestions are truly “reject-correct” by making them inverted of a good fix if needed
-  // (Already likely, but we enforce)
-  let badCount = 0;
-  for (const s of suggestions) if (!s.isGood) badCount++;
-  if (badCount < needBad) {
-    // force some in the middle to be inverted version of their predecessor if possible
-    for (let i = 2; i < suggestions.length - 2 && badCount < needBad; i++) {
-      const prev = suggestions[i - 1];
-      const inv = invertTrade(prev, rates);
-      if (!inv) continue;
-      const beforeErr = t0ErrorUsdL1(s0.balances, rates);
-      const afterErr = t0ErrorUsdL1(applyFxSwap(s0, inv).balances, rates);
-      if (afterErr >= beforeErr) {
-        suggestions[i] = {
-          ...suggestions[i],
-          ...inv,
-          id: id(),
-          isGood: false,
-          usdCost: (() => {
-            const u = swapUsdCost({ notionalBuy: inv.notionalBuy, spot: inv.spot, fwd: inv.fwd, sellCcy: inv.sellCcy }, rates);
-            return Number.isFinite(u) ? u : null;
-          })(),
-        };
-        badCount++;
-      }
-    }
-  }
-
-  return { suggestions, totalPlanned };
 }
 
 /* ----------------------------- UI ----------------------------- */
@@ -859,13 +761,12 @@ function Modal({
 }) {
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/60" onClick={onOk} />
-      <div className="relative w-full max-w-lg rounded-2xl bg-white border border-slate-200 shadow-xl p-5">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+      <div className="w-full max-w-lg rounded-2xl bg-white border border-slate-200 shadow-lg p-5">
         <div className="text-lg font-extrabold text-slate-900">{title}</div>
-        <div className="mt-2 text-sm font-semibold text-slate-800 whitespace-pre-wrap">{message}</div>
+        <div className="mt-2 text-sm font-semibold text-slate-700 whitespace-pre-wrap">{message}</div>
         <div className="mt-4 flex justify-end">
-          <button onClick={onOk} className="px-5 py-3 rounded-2xl text-sm font-extrabold bg-slate-900 text-white hover:bg-slate-800 transition">
+          <button onClick={onOk} className="px-5 py-3 rounded-2xl text-sm font-bold bg-slate-900 text-white hover:bg-slate-800 transition">
             OK
           </button>
         </div>
@@ -883,14 +784,23 @@ type TradeLogItem = {
   timestamp: number;
   correct?: boolean;
   mode?: "basic" | "guided" | "manual";
+  tag?: "REVERSAL";
 };
 
 type BasicDecision = {
   id: string;
   action: "execute" | "reject";
-  wasGood: boolean;
-  correct: boolean;
+  wasGood: boolean; // whether correct action would be execute
+  correct: boolean; // whether user's decision matched
+  executed: boolean; // whether trade actually executed
   timestamp: number;
+};
+
+type HistoryItem = {
+  scenarioBefore: Scenario;
+  trade: SwapTrade;
+  logId: string;
+  mode: "basic" | "guided" | "manual";
 };
 
 export default function Page() {
@@ -898,13 +808,6 @@ export default function Page() {
   const [dayNumber, setDayNumber] = useState(1);
 
   const [previewEnabled, setPreviewEnabled] = useState(false);
-
-  // Modal state (rolling + outcomes)
-  const [modal, setModal] = useState<{ open: boolean; title: string; message: string; onOk?: () => void }>({
-    open: false,
-    title: "",
-    message: "",
-  });
 
   // Rates
   const [rates, setRates] = useState<UsdRates>(() => makeEmptyRates());
@@ -961,13 +864,19 @@ export default function Page() {
   }, []);
 
   // Shared scenario
-  const [scenario, setScenario] = useState<Scenario>(() => generateGuidedSolvableScenario());
+  const [scenario, setScenario] = useState<Scenario>(() => generateScenarioRaw());
+
+  // When rates become OK, cap scenario so JPY/MXN/PHP can be big (<=100m USD eq)
+  useEffect(() => {
+    if (rates.status !== "ok") return;
+    setScenario((s) => capScenarioToUsdEq(s, rates));
+  }, [rates.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Trade log (actual executed swaps)
   const [tradeLog, setTradeLog] = useState<TradeLogItem[]>([]);
 
-  // Day cost history (tiles): prior days are “locked”; current day is live.
-  const [dayCosts, setDayCosts] = useState<number[]>([]); // index 0 => Day 1 locked cost, etc.
+  // Execution history (for undo)
+  const [history, setHistory] = useState<HistoryItem[]>([]);
 
   const totalCost = useMemo(() => {
     let t = 0;
@@ -975,101 +884,115 @@ export default function Page() {
     return t;
   }, [tradeLog]);
 
-  function logTrade(t: SwapTrade, opts?: { correct?: boolean; mode?: TradeLogItem["mode"]; labelOverride?: string }) {
+  function logTrade(t: SwapTrade, correct?: boolean, mode?: TradeLogItem["mode"], tag?: TradeLogItem["tag"]) {
     const usdC =
       ratesRef.current.status === "ok"
         ? swapUsdCost({ notionalBuy: t.notionalBuy, spot: t.spot, fwd: t.fwd, sellCcy: t.sellCcy }, ratesRef.current)
         : NaN;
 
-    const label =
-      opts?.labelOverride ??
-      `Buy ${t.buyCcy} / Sell ${t.sellCcy} · ${formatM(t.notionalBuy)} ${t.buyCcy}`;
+    const item: TradeLogItem = {
+      id: id(),
+      label: `${tag ? `${tag} · ` : ""}Buy ${t.buyCcy} / Sell ${t.sellCcy} · ${formatM(t.notionalBuy)} ${t.buyCcy}`,
+      usdCost: Number.isFinite(usdC) ? usdC : null,
+      timestamp: Date.now(),
+      correct,
+      mode,
+      tag,
+    };
 
-    setTradeLog((prev) => [
-      {
-        id: id(),
-        label,
-        usdCost: Number.isFinite(usdC) ? usdC : null,
-        timestamp: Date.now(),
-        correct: opts?.correct,
-        mode: opts?.mode,
-      },
-      ...prev,
-    ]);
+    setTradeLog((prev) => [item, ...prev]);
+    return item.id;
   }
 
-  // -------- Roll evaluation + execution (centralized) --------
-
-  function evaluateRollMessage(context: "basic" | "guided" | "manual") {
-    const r = ratesRef.current;
-    if (r.status !== "ok") {
-      return { title: "Rolling value date", message: "Rates are still loading. Rolling will proceed using the current scenario state." };
-    }
-
-    const solved = nonUsdSquaredAtT0UsdEq(scenario.balances, r);
-    const idle = allNonUsdLongButSomeIdle(scenario.balances, r);
-    const allLong = (() => {
-      for (const c of CCYS) {
-        if (c === "USD") continue;
-        const usdEq = toUsd(scenario.balances[c] ?? 0, c, r);
-        if (!Number.isFinite(usdEq)) return false;
-        if (usdEq < -TOL_USD) return false;
-      }
-      return true;
-    })();
-
-    if (context === "manual") {
-      if (!solved && !allLong) {
-        return { title: "Roll Value Date", message: "We were short - Customer payments didn't go out, bad day at the office" };
-      }
-      if (solved) return { title: "Roll Value Date", message: "Well done, the value date will now roll" };
-      if (idle) return { title: "Roll Value Date", message: "Everything got funded, but we left idle cash on the table" };
-      return { title: "Roll Value Date", message: "You ran out of time, the value date will now roll" };
-    }
-
-    // basic/guided
-    if (solved) return { title: "Roll Value Date", message: "Well done, the value date will now roll" };
-    if (idle) return { title: "Roll Value Date", message: "Everything got funded, but we left idle cash on the table" };
-    return { title: "Roll Value Date", message: "You ran out of time, the value date will now roll" };
+  function pushHistory(sBefore: Scenario, t: SwapTrade, logId: string, mode: HistoryItem["mode"]) {
+    setHistory((prev) => [{ scenarioBefore: sBefore, trade: t, logId, mode }, ...prev]);
   }
 
-  function doRollDay() {
-    // lock in current day's cost into history before resetting today
-    setDayCosts((prev) => [...prev, totalCost]);
+  function undoLastTrade(mode: HistoryItem["mode"]) {
+    const h = history.find((x) => x.mode === mode);
+    if (!h) return;
 
-    setScenario((s) => rollValueDate(s));
-    setDayNumber((d) => d + 1);
-    setTradeLog([]);
+    // restore scenario
+    setScenario(h.scenarioBefore);
 
-    // reset guided/basic/manual per-day state
-    resetGuidedForNewDay();
-    resetBasicForNewDay(true);
+    // remove from history
+    setHistory((prev) => {
+      const idx = prev.findIndex((x) => x === h);
+      if (idx < 0) return prev;
+      const next = [...prev];
+      next.splice(idx, 1);
+      return next;
+    });
+
+    // remove the corresponding log entry (UNDO removes it in guided)
+    setTradeLog((prev) => prev.filter((x) => x.id !== h.logId));
+
+    // Also clear previews
+    setPreviewScenario(null);
     setManualPreview(null);
   }
 
-  function openRollModal(context: "basic" | "guided" | "manual") {
-    const { title, message } = evaluateRollMessage(context);
+  /* ----------------------------- Day roll + modal ----------------------------- */
+
+  const [modal, setModal] = useState<{ open: boolean; title: string; message: string; onOk: () => void }>({
+    open: false,
+    title: "",
+    message: "",
+    onOk: () => {},
+  });
+
+  function closeModal() {
+    setModal((m) => ({ ...m, open: false }));
+  }
+
+  function rollDayWithMessage(message: string) {
     setModal({
       open: true,
-      title,
+      title: "Value date roll",
       message,
       onOk: () => {
-        setModal({ open: false, title: "", message: "" });
-        doRollDay();
+        closeModal();
+        // roll value date + reset per-day state
+        setScenario((s) => rollValueDate(s));
+        setDayNumber((d) => d + 1);
+
+        setTradeLog([]);
+        setHistory([]);
+
+        // Basic reset
+        setBasicDecisions([]);
+        setBasicIncorrect({ active: false });
+        setBasicPlan([]);
+        setBasicIndex(0);
+
+        // Guided reset
+        setGuidedStep(0);
+        setGuidedScore(0);
+        setGuidedTiles([]);
+        setGuidedReveal(new Set());
+        setGuidedSelected(null);
+        setGuidedReversalPrompt(null);
+        setPreviewScenario(null);
+
+        // Manual reset preview only
+        setManualPreview(null);
       },
     });
   }
 
-  // -------- Basic state --------
+  /* ----------------------------- Basic decision scoring ----------------------------- */
 
   const [basicDecisions, setBasicDecisions] = useState<BasicDecision[]>([]);
-  const basicCorrect = useMemo(() => basicDecisions.filter((d) => d.correct).length, [basicDecisions]);
-  const basicTotal = basicDecisions.length;
+  const swapsTradedCorrectExecuted = useMemo(
+    () => basicDecisions.filter((d) => d.correct && d.executed).length,
+    [basicDecisions]
+  );
 
+  // Basic state
   const [basicPlan, setBasicPlan] = useState<BasicSuggestion[]>([]);
-  const [basicIdx, setBasicIdx] = useState(0);
+  const [basicIndex, setBasicIndex] = useState(0);
 
-  const basicSuggestion = basicPlan[basicIdx] ?? null;
+  const basicSuggestion = useMemo(() => (basicPlan[basicIndex] ? basicPlan[basicIndex] : null), [basicPlan, basicIndex]);
 
   const [basicIncorrect, setBasicIncorrect] = useState<{
     active: boolean;
@@ -1095,75 +1018,55 @@ export default function Page() {
     return { changed, prev };
   }
 
-  function recordBasicDecision(action: "execute" | "reject", wasGood: boolean, correct: boolean) {
-    setBasicDecisions((prev) => [{ id: id(), action, wasGood, correct, timestamp: Date.now() }, ...prev]);
-  }
-
-  function resetBasicForNewDay(forceRebuild: boolean) {
-    setBasicIncorrect({ active: false });
-    setBasicIdx(0);
-    if (forceRebuild && ratesRef.current.status === "ok") {
-      const { suggestions } = buildBasicPlan(scenario, ratesRef.current);
-      setBasicPlan(suggestions);
-    }
-  }
-
-  // Build basic plan when rates become OK or scenario changes day-to-day
+  // Build basic plan whenever rates OK and scenario/day changes (and not in an incorrect/undo state)
   useEffect(() => {
     if (rates.status !== "ok") return;
-    const { suggestions } = buildBasicPlan(scenario, rates);
-    setBasicPlan(suggestions);
-    setBasicIdx(0);
-    setBasicIncorrect({ active: false });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rates.status, dayNumber]);
+    if (basicIncorrect.active) return;
+    const plan = buildBasicPlanForDay(scenario, rates);
+    setBasicPlan(plan);
+    setBasicIndex(0);
+  }, [rates.status, dayNumber, basicIncorrect.active]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  function advanceBasic() {
-    setBasicIdx((i) => Math.min(i + 1, Math.max(0, basicPlan.length - 1)));
+  function recordBasicDecision(action: "execute" | "reject", wasGood: boolean, correct: boolean, executed: boolean) {
+    setBasicDecisions((prev) => [{ id: id(), action, wasGood, correct, executed, timestamp: Date.now() }, ...prev]);
   }
 
   function basicChoose(action: "execute" | "reject") {
     if (!basicSuggestion || ratesRef.current.status !== "ok") return;
+    if (basicIncorrect.active) return;
 
     const s0 = scenario;
-    const beforeErr = t0ErrorUsdL1(s0.balances, ratesRef.current);
-    const afterScenario = applyFxSwap(s0, basicSuggestion);
-    const afterErr = t0ErrorUsdL1(afterScenario.balances, ratesRef.current);
-    const improves = afterErr < beforeErr; // “good” trade
 
-    const correct = action === "execute" ? improves : !improves;
-    recordBasicDecision(action, improves, correct);
+    // correct action: execute if isGood else reject
+    const correct = action === "execute" ? basicSuggestion.isGood : !basicSuggestion.isGood;
 
-    if (correct) {
-      if (action === "execute") {
-        setScenario(afterScenario);
-        logTrade(basicSuggestion, { correct: true, mode: "basic" });
-      }
-      setBasicIncorrect({ active: false });
+    // If user executes, trade executes. If user rejects, trade does not execute.
+    // Penalty behavior: if user is incorrect, we execute anyway (same as before), with undo & next.
+    const shouldExecute = action === "execute" ? true : false;
+    const willExecute = correct ? shouldExecute : true;
 
-      // Check solved now (after execution if executed, else current)
-      const cur = action === "execute" ? afterScenario : s0;
-      if (ratesRef.current.status === "ok" && nonUsdSquaredAtT0UsdEq(cur.balances, ratesRef.current)) {
-        setModal({
-          open: true,
-          title: "Nice work",
-          message: "Well Done, the value date will now roll",
-          onOk: () => {
-            setModal({ open: false, title: "", message: "" });
-            doRollDay();
-          },
-        });
-        return;
-      }
+    recordBasicDecision(action, basicSuggestion.isGood, correct, willExecute && correct);
 
-      advanceBasic();
+    if (!willExecute) {
+      // correct reject on a bad suggestion => just advance
+      setBasicIndex((i) => Math.min(i + 1, basicPlan.length));
       return;
     }
 
-    // Wrong: execute anyway, show changed cells with prev values, allow undo
-    const { changed, prev } = diffCellsAndPrev(s0, afterScenario);
+    // execute trade
+    const afterScenario = applyFxSwap(s0, basicSuggestion);
     setScenario(afterScenario);
-    logTrade(basicSuggestion, { correct: false, mode: "basic" });
+
+    const logId = logTrade(basicSuggestion, correct, "basic");
+    pushHistory(s0, basicSuggestion, logId, "basic");
+
+    if (correct) {
+      setBasicIndex((i) => Math.min(i + 1, basicPlan.length));
+      return;
+    }
+
+    // incorrect: show changed cells, allow undo
+    const { changed, prev } = diffCellsAndPrev(s0, afterScenario);
     setBasicIncorrect({ active: true, lastScenarioBefore: s0, changedCells: changed, prevValues: prev });
   }
 
@@ -1172,170 +1075,146 @@ export default function Page() {
     const restored = basicIncorrect.lastScenarioBefore;
     setScenario(restored);
     setBasicIncorrect({ active: false });
-    advanceBasic(); // next suggestion (plan already ensures different pair after bad offerings)
+    setBasicIndex((i) => Math.min(i + 1, basicPlan.length)); // move on to next suggestion
   }
 
-  const basicMovesLeft = Math.max(0, basicPlan.length - basicIdx);
+  // Auto-roll when basic solved
+  useEffect(() => {
+    if (rates.status !== "ok") return;
+    if (tab !== "basic") return;
+    if (basicIncorrect.active) return;
 
-  // -------- Guided state --------
+    const solved = solvedT0Long0to5mUsdEq(scenario.balances, rates);
+    if (solved) {
+      rollDayWithMessage("Well Done, the value date will now roll.");
+    }
+  }, [scenario, rates.status, tab, basicIncorrect.active]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ----------------------------- Guided state ----------------------------- */
 
   const [guidedStep, setGuidedStep] = useState(0);
   const [guidedScore, setGuidedScore] = useState(0);
   const [guidedTiles, setGuidedTiles] = useState<GuidedTile[]>([]);
-  const [revealed, setRevealed] = useState<Set<string>>(new Set());
-  const [selected, setSelected] = useState<GuidedTile | null>(null);
+  const [guidedReveal, setGuidedReveal] = useState<Set<string>>(new Set());
+  const [guidedSelected, setGuidedSelected] = useState<GuidedTile | null>(null);
   const [previewScenario, setPreviewScenario] = useState<Scenario | null>(null);
 
-  // Track history for undo + reversal prompts
-  const [guidedHistory, setGuidedHistory] = useState<Array<{ before: Scenario; trade: SwapTrade; tradeLogLabel: string }>>([]);
-  const [guidedReversalPrompt, setGuidedReversalPrompt] = useState<null | { before: Scenario; trade: GuidedTile }>(null);
+  // reversal prompt
+  const [guidedReversalPrompt, setGuidedReversalPrompt] = useState<{
+    open: boolean;
+    lastScenarioBefore: Scenario;
+    lastTrade: GuidedTile;
+  } | null>(null);
 
-  const swapsLeft = GUIDED_STEPS_PER_DAY - guidedStep;
+  const swapsLeft = GUIDED_MAX_STEPS - guidedStep;
 
-  function resetGuidedForNewDay() {
-    setGuidedStep(0);
-    setGuidedScore(0);
-    setSelected(null);
+  function refreshGuidedTiles(currentScenario: Scenario) {
+    if (ratesRef.current.status !== "ok") return;
+    const tiles = buildGuidedFourTiles(currentScenario, ratesRef.current);
+    setGuidedTiles(tiles);
+    setGuidedReveal(new Set());
+    setGuidedSelected(null);
     setPreviewScenario(null);
-    setRevealed(new Set());
-    setGuidedHistory([]);
-    setGuidedReversalPrompt(null);
-    if (ratesRef.current.status === "ok") {
-      setGuidedTiles(generateGuidedTiles(scenario, ratesRef.current));
-    } else {
-      setGuidedTiles([]);
-    }
   }
 
   useEffect(() => {
     if (rates.status !== "ok") return;
-    setGuidedTiles(generateGuidedTiles(scenario, rates));
-    setPreviewScenario(null);
-    setSelected(null);
-    setRevealed(new Set());
-    setGuidedReversalPrompt(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenario, rates.status]);
+    refreshGuidedTiles(scenario);
+  }, [rates.status, dayNumber]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function previewGuided(t: GuidedTile) {
     if (!previewEnabled) return;
     setPreviewScenario(applyFxSwap(scenario, t));
   }
 
-  function clearPreview() {
-    setPreviewScenario(null);
-    setManualPreview(null);
-  }
-
-  function undoLastGuidedTrade() {
-    setGuidedReversalPrompt(null);
-    setGuidedHistory((hist) => {
-      if (hist.length === 0) return hist;
-      const last = hist[0];
-      setScenario(last.before);
-      setGuidedStep((x) => Math.max(0, x - 1));
-      // Remove the most recent tradeLog item (we logged it at the front)
-      setTradeLog((prev) => prev.slice(1));
-      setSelected(null);
-      setPreviewScenario(null);
-      setRevealed((prev) => {
-        const n = new Set(prev);
-        // keep revealed as-is; user already saw outcomes
-        return n;
-      });
-      return hist.slice(1);
-    });
-  }
-
-  function makeReversalTrade(t: GuidedTile): SwapTrade | null {
-    // Reverse near leg approximately:
-    // Buy original sellCcy (amount ~= nearSellAbs) / Sell original buyCcy at inverse spot/fwd.
-    const nearSellAbs = Math.abs(Math.round(t.notionalBuy * t.spot));
-    const invSpot = t.spot !== 0 ? 1 / t.spot : null;
-    const invFwd = t.fwd !== 0 ? 1 / t.fwd : null;
-    if (!invSpot || !invFwd) return null;
-
-    const rev: SwapTrade = {
-      buyCcy: t.sellCcy,
-      sellCcy: t.buyCcy,
-      notionalBuy: Math.max(1, nearSellAbs),
-      nearOffset: t.nearOffset,
-      farOffset: t.farOffset,
-      spot: invSpot,
-      fwd: invFwd,
-    };
-
-    if (ratesRef.current.status === "ok") return capTradeToUsd(rev, ratesRef.current);
-    return rev;
-  }
-
   function executeGuided(t: GuidedTile) {
     if (ratesRef.current.status !== "ok") return;
-    if (guidedStep >= GUIDED_STEPS_PER_DAY) return;
+    if (guidedStep >= GUIDED_MAX_STEPS) return;
 
     const before = scenario;
-    const beforeErr = t0ErrorUsdL1(before.balances, ratesRef.current);
-
+    const beforeBad = t0BadnessUsdEq(before.balances, ratesRef.current);
     const after = applyFxSwap(before, t);
-    const afterErr = t0ErrorUsdL1(after.balances, ratesRef.current);
-    const improves = afterErr < beforeErr;
+    const afterBad = t0BadnessUsdEq(after.balances, ratesRef.current);
 
     setScenario(after);
 
-    setRevealed((prev) => {
+    setGuidedReveal((prev) => {
       const n = new Set(prev);
       n.add(t.id);
       return n;
     });
-    setSelected(t);
+    setGuidedSelected(t);
+    setGuidedScore((x) => x + t.scoreDelta);
 
-    // scoring scaled for 15 swaps (max 100)
-    setGuidedScore((x) => clamp(x + (t.category === "Best" ? 7 : t.category === "Marginal" ? 3 : -3), 0, 100));
-
-    const label = `Buy ${t.buyCcy} / Sell ${t.sellCcy} · ${formatM(t.notionalBuy)} ${t.buyCcy}`;
-    logTrade(t, { correct: improves, mode: "guided", labelOverride: label });
-
-    // push history for undo (store newest at front)
-    setGuidedHistory((prev) => [{ before, trade: t, tradeLogLabel: label }, ...prev]);
+    const logId = logTrade(t, t.category === "Best", "guided");
+    pushHistory(before, t, logId, "guided");
 
     setGuidedStep((x) => x + 1);
     setPreviewScenario(null);
 
-    if (!improves) {
-      setGuidedReversalPrompt({ before, trade: t });
-    } else {
-      setGuidedReversalPrompt(null);
+    // If it clearly went wrong (badness got worse), offer reversal
+    if (afterBad > beforeBad) {
+      setGuidedReversalPrompt({ open: true, lastScenarioBefore: before, lastTrade: t });
     }
+
+    // Always regenerate a fresh set of 4 tiles after an execute
+    refreshGuidedTiles(after);
   }
 
-  // When guided swaps run out, show outcome modal then roll
+  function guidedDoReversalYes() {
+    if (!guidedReversalPrompt) return;
+    const { lastScenarioBefore, lastTrade } = guidedReversalPrompt;
+
+    // Undo blotter impact
+    setScenario(lastScenarioBefore);
+    setPreviewScenario(null);
+
+    // Keep cost tracker for original trade, and add reversal trade entry
+    const rev = invertTrade(lastTrade);
+    logTrade(rev, undefined, "guided", "REVERSAL");
+
+    // Do NOT refund swaps left, do NOT remove original log, do NOT undo history.
+    setGuidedReversalPrompt(null);
+
+    // Refresh tiles from restored scenario
+    refreshGuidedTiles(lastScenarioBefore);
+  }
+
+  function guidedDoReversalNo() {
+    setGuidedReversalPrompt(null);
+  }
+
+  // Guided end-of-day logic when swaps reach zero
   useEffect(() => {
-    if (tab !== "guided") return;
     if (rates.status !== "ok") return;
-    if (guidedStep < GUIDED_STEPS_PER_DAY) return;
+    if (tab !== "guided") return;
+    if (guidedStep < GUIDED_MAX_STEPS) return;
 
-    const solved = nonUsdSquaredAtT0UsdEq(scenario.balances, rates);
-    const idle = allNonUsdLongButSomeIdle(scenario.balances, rates);
+    const solved = solvedT0Long0to5mUsdEq(scenario.balances, rates);
+    if (solved) {
+      rollDayWithMessage("Well done, the value date will now roll.");
+      return;
+    }
 
-    const message = solved
-      ? "Well done, the value date will now roll"
-      : idle
-      ? "Everything got funded, but we left idle cash on the table"
-      : "You ran out of time, the value date will now roll";
+    // If all non-USD are long but some > 5m -> idle cash
+    const u = usdEqT0(scenario.balances, rates);
+    let allLong = true;
+    let anyIdle = false;
+    for (const c of CCYS) {
+      if (c === "USD") continue;
+      if (!Number.isFinite(u[c])) continue;
+      if (u[c] < 0) allLong = false;
+      if (u[c] > TOL_USD_EQ) anyIdle = true;
+    }
+    if (allLong && anyIdle) {
+      rollDayWithMessage("Everything got funded, but we left idle cash on the table.");
+      return;
+    }
 
-    setModal({
-      open: true,
-      title: "Day complete",
-      message,
-      onOk: () => {
-        setModal({ open: false, title: "", message: "" });
-        doRollDay();
-      },
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [guidedStep, tab, rates.status]);
+    rollDayWithMessage("You ran out of time, the value date will now roll.");
+  }, [guidedStep, scenario, rates.status, tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // -------- Manual swap entry --------
+  /* ----------------------------- Manual swap entry ----------------------------- */
 
   const [c1, setC1] = useState<Ccy>("EUR");
   const [c2, setC2] = useState<Ccy>("USD");
@@ -1375,9 +1254,17 @@ export default function Page() {
     if (!sp) return null;
     const fw = forwardFromSpot(sp, buyCcy, sellCcy, Math.max(1, mFar - mNear));
 
-    // Cap manual too? (not requested, but keeps consistency)
-    const t0: SwapTrade = { buyCcy, sellCcy, notionalBuy: Math.round(nBuy), nearOffset: mNear, farOffset: mFar, spot: sp, fwd: fw };
-    return capTradeToUsd(t0, ratesRef.current);
+    const t0: SwapTrade = {
+      buyCcy,
+      sellCcy,
+      notionalBuy: Math.round(nBuy),
+      nearOffset: mNear,
+      farOffset: mFar,
+      spot: sp,
+      fwd: fw,
+    };
+
+    return clampNotionalBuyToUsdEq(t0, ratesRef.current);
   }
 
   // Update the 4 boxes when user edits any one box
@@ -1450,32 +1337,33 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rates.status, c1, c2, nearBuysC1, mNear, mFar, nearBuyStr]);
 
-  /* ----------------------------- Reset ----------------------------- */
+  /* ----------------------------- Reset / Roll ----------------------------- */
 
   function resetAll() {
-    const s = generateGuidedSolvableScenario();
-    setScenario(s);
+    const s = generateScenarioRaw();
+    setScenario(ratesRef.current.status === "ok" ? capScenarioToUsdEq(s, ratesRef.current) : s);
     setDayNumber(1);
-    setTradeLog([]);
-    setDayCosts([]);
-    setBasicDecisions([]);
 
+    setTradeLog([]);
+    setHistory([]);
+
+    // Basic
+    setBasicDecisions([]);
+    setBasicIncorrect({ active: false });
+    setBasicPlan([]);
+    setBasicIndex(0);
+
+    // Guided
     setGuidedStep(0);
     setGuidedScore(0);
     setGuidedTiles([]);
-    setRevealed(new Set());
-    setSelected(null);
-    setPreviewScenario(null);
-    setGuidedHistory([]);
+    setGuidedReveal(new Set());
+    setGuidedSelected(null);
     setGuidedReversalPrompt(null);
+    setPreviewScenario(null);
 
-    setBasicIncorrect({ active: false });
-    setBasicIdx(0);
-    setBasicPlan([]);
-
+    // Manual
     setManualPreview(null);
-
-    // reset manual fields
     setC1("EUR");
     setC2("USD");
     setNearBuysC1(true);
@@ -1485,60 +1373,64 @@ export default function Page() {
     setNearBuyStr("25,000,000");
   }
 
+  function rollButtonClicked() {
+    // Manual roll behavior: show messages based on state.
+    if (ratesRef.current.status === "ok") {
+      const solved = solvedT0Long0to5mUsdEq(scenario.balances, ratesRef.current);
+      if (solved) {
+        rollDayWithMessage("Well done, the value date will now roll.");
+        return;
+      }
+      // If not all long, but also not all long (some shorts), show short message
+      const u = usdEqT0(scenario.balances, ratesRef.current);
+      let anyShort = false;
+      let anyLong = false;
+      for (const c of CCYS) {
+        if (c === "USD") continue;
+        const v = u[c];
+        if (!Number.isFinite(v)) continue;
+        if (v < 0) anyShort = true;
+        if (v > 0) anyLong = true;
+      }
+      if (anyShort && anyLong) {
+        rollDayWithMessage("We were short - Customer payments didn't go out, bad day at the office.");
+        return;
+      }
+      rollDayWithMessage("You ran out of time, the value date will now roll.");
+      return;
+    }
+
+    rollDayWithMessage("Value date will now roll.");
+  }
+
   const displayScenario = tab === "guided" ? previewScenario ?? scenario : tab === "manual" ? manualPreview ?? scenario : scenario;
 
-  const solvedNowUsdEq = useMemo(() => (rates.status === "ok" ? nonUsdSquaredAtT0UsdEq(scenario.balances, rates) : false), [scenario, rates.status]);
-  const guidedSolvedUsdEq = useMemo(
-    () => (rates.status === "ok" ? nonUsdSquaredAtT0UsdEq((previewScenario ?? scenario).balances, rates) : false),
-    [scenario, previewScenario, rates.status]
+  const solvedNow = useMemo(() => (rates.status === "ok" ? solvedT0Long0to5mUsdEq(scenario.balances, rates) : false), [scenario, rates]);
+  const solvedPreviewOrNow = useMemo(
+    () => (rates.status === "ok" ? solvedT0Long0to5mUsdEq((previewScenario ?? scenario).balances, rates) : false),
+    [scenario, previewScenario, rates]
   );
 
   const objectiveBanner = (
-    <>
-      <div className="text-sm font-semibold text-slate-900">
-        Objective: square all <span className="font-bold">non-USD</span> <span className="font-bold">t+0</span> positions to within{" "}
-        <span className="font-bold">±$5m USD-equiv</span>. USD is exempt.
+    <div className="space-y-1">
+      <div className="text-sm font-semibold text-white">
+        Objective (SOLVED): every <span className="font-extrabold">non-USD</span> <span className="font-extrabold">t+0</span> position must be{" "}
+        <span className="font-extrabold">LONG</span> and within <span className="font-extrabold">$0 to $5m USD-equivalent</span>. (USD is exempt.)
       </div>
-      <div className="text-sm font-semibold text-slate-900">
-        Blotter cells are shown in the <span className="font-bold">native currency</span> on the left; the objective check is done in{" "}
-        <span className="font-bold">USD-equivalent</span>.
+      <div className="text-sm font-semibold text-white">
+        Note: MXN and PHP must be long balances (covered by the rule above), and blotter values are shown in their own currency (not USD).
       </div>
-      <div className="text-sm font-semibold text-slate-900">
-        t+1..t+14 columns show <span className="font-bold">net cashflow</span> for that date (seeded trades + your swaps), not a predicted balance.
+      <div className="text-sm font-semibold text-white">
+        t+1..t+14 columns show <span className="font-extrabold">net cashflow</span> for that date (seeded trades + your swaps), not a predicted balance.
       </div>
-    </>
+    </div>
   );
 
-  const ratesList = useMemo(() => {
-    const items = CCYS.map((c) => ({ ccy: c, cPerUsd: rates.ccyPerUsd[c], usdPerC: rates.usdPerCcy[c] }));
-    return items.sort((a, b) => a.ccy.localeCompare(b.ccy));
-  }, [rates]);
-
-  // Day tiles: show locked days + current day live
-  const dayTiles = useMemo(() => {
-    const locked = dayCosts.map((v, idx) => ({ day: idx + 1, cost: v, locked: true }));
-    const current = { day: dayNumber, cost: totalCost, locked: false };
-    return [...locked, current];
-  }, [dayCosts, dayNumber, totalCost]);
+  /* ----------------------------- Cost panel (no Clear preview button) ----------------------------- */
 
   const costPanel = (
     <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4">
-      <div className="flex flex-wrap items-start gap-3">
-        {dayTiles.map((d) => (
-          <Pill key={`${d.day}-${d.locked ? "locked" : "live"}`} label={`Day ${d.day} USD cost/gain`} value={`$${formatInt(d.cost)}`} />
-        ))}
-
-        <div className="ml-auto flex items-center gap-2">
-          <button
-            onClick={clearPreview}
-            className="px-4 py-3 rounded-2xl text-sm font-semibold border border-slate-200 bg-white hover:bg-slate-50 transition text-slate-900"
-          >
-            Clear preview
-          </button>
-        </div>
-      </div>
-
-      <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200">
+      <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200">
         <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 text-sm font-bold text-slate-900">Cost tracker</div>
         <div className="max-h-[220px] overflow-auto">
           {tradeLog.length === 0 ? (
@@ -1571,48 +1463,56 @@ export default function Page() {
     </div>
   );
 
-  // FX rates panel
-  const fxRatesPanel = (
-    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 max-w-3xl">
+  /* ----------------------------- FX Rates Matrix ----------------------------- */
+
+  const ratesMatrixPanel = (
+    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 max-w-6xl">
       <div className="flex items-end justify-between gap-3">
         <div>
-          <div className="text-lg font-semibold text-slate-900">FX Rates vs USD</div>
+          <div className="text-lg font-semibold text-slate-900">FX Rates Matrix</div>
           <div className="text-sm font-semibold text-slate-900">Source: frankfurter.app {rates.asOf ? `· As of ${rates.asOf}` : ""}</div>
         </div>
-        <div className="text-sm font-semibold text-slate-900">
-          {rates.status === "loading" ? "Loading…" : rates.status === "error" ? `Error: ${rates.error}` : "Live"}
-        </div>
+        <div className="text-sm font-semibold text-slate-900">{rates.status === "loading" ? "Loading…" : rates.status === "error" ? `Error: ${rates.error}` : "Live"}</div>
       </div>
 
       <div className="mt-4 overflow-auto rounded-2xl border border-slate-200">
-        <table className="w-full text-sm">
-          <thead className="bg-white">
+        <table className="min-w-[900px] w-full text-sm">
+          <thead className="bg-white sticky top-0 z-10">
             <tr>
-              <th className="text-left p-2 border-b border-slate-200 text-slate-900 font-semibold">CCY</th>
-              <th className="text-right p-2 border-b border-slate-200 text-slate-900 font-semibold">1 USD =</th>
-              <th className="text-right p-2 border-b border-slate-200 text-slate-900 font-semibold">1 CCY =</th>
+              <th className="text-left p-2 border-b border-slate-200 text-slate-900 font-semibold">1 CCY =</th>
+              {CCYS.map((c) => (
+                <th key={c} className="text-right p-2 border-b border-slate-200 text-slate-900 font-semibold">
+                  {c}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
-            {ratesList.map((r) => (
-              <tr key={r.ccy} className="border-b border-slate-100 last:border-b-0">
-                <td className="p-2 font-semibold text-slate-900">{r.ccy}</td>
-                <td className="p-2 text-right font-semibold text-slate-900">
-                  {fmt4(r.cPerUsd)} {r.ccy}
-                </td>
-                <td className="p-2 text-right font-semibold text-slate-900">
-                  {fmt4(r.usdPerC)} USD
-                </td>
+            {CCYS.map((row) => (
+              <tr key={row} className="border-b border-slate-100 last:border-b-0">
+                <td className="p-2 font-semibold text-slate-900">{row}</td>
+                {CCYS.map((col) => {
+                  const r = rates.status === "ok" ? spotFromUsdRates(row, col, rates) : null; // col per row
+                  const dp = row === "MXN" || row === "PHP" || col === "MXN" || col === "PHP" ? 2 : 4;
+                  const txt = row === col ? "1.0000" : r === null ? "—" : r.toFixed(dp);
+                  return (
+                    <td key={col} className="p-2 text-right font-semibold text-slate-900 tabular-nums">
+                      {txt}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
         </table>
       </div>
 
-      <div className="h-4" />
-      <div className="text-xs font-semibold text-slate-700">Note: Carry/forwards are simplified using static IR assumptions + a small forward-points spread.</div>
+      <div className="h-3" />
+      <div className="text-xs font-semibold text-slate-700">Matrix cells show: 1 unit of the row currency equals X units of the column currency.</div>
     </div>
   );
+
+  /* ----------------------------- Manual spot/fwd display ----------------------------- */
 
   const { buyCcy: manualBuyCcy, sellCcy: manualSellCcy } = getManualBuySell();
   const manualSpot = useMemo(() => {
@@ -1626,36 +1526,46 @@ export default function Page() {
     return forwardFromSpot(manualSpot, manualBuyCcy, manualSellCcy, Math.max(1, mFar - mNear));
   }, [manualSpot, manualBuyCcy, manualSellCcy, mFar, mNear]);
 
-  // Guided tile counter amount helper (near leg)
-  function counterAmountNear(t: { notionalBuy: number; spot: number }) {
-    return Math.round(t.notionalBuy * t.spot);
-  }
+  /* ----------------------------- Render ----------------------------- */
 
   return (
-    <div className="min-h-screen bg-[#001B5E]">
+    <div className="min-h-screen" style={{ backgroundColor: REMITLY_NAVY }}>
+      <Modal open={modal.open} title={modal.title} message={modal.message} onOk={modal.onOk} />
+
+      {/* Reversal prompt modal */}
       <Modal
-        open={modal.open}
-        title={modal.title}
-        message={modal.message}
-        onOk={() => {
-          if (modal.onOk) modal.onOk();
-          else setModal({ open: false, title: "", message: "" });
-        }}
+        open={!!guidedReversalPrompt?.open}
+        title="Wrong-way move"
+        message={"This went the wrong way, execute a reversal?"}
+        onOk={guidedDoReversalYes}
       />
+      {guidedReversalPrompt?.open ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center pointer-events-none">
+          {/* A second overlay with NO option */}
+          <div className="pointer-events-auto -mt-24">
+            <button
+              onClick={guidedDoReversalNo}
+              className="px-5 py-3 rounded-2xl text-sm font-extrabold bg-white border border-slate-200 hover:bg-slate-50 transition text-slate-900 shadow"
+            >
+              No
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <div className="max-w-7xl mx-auto p-6 pb-24 space-y-5">
         {/* Header */}
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-3">
-            {/* Simple logo mark (inline) */}
-            <div className="w-9 h-9 rounded-2xl bg-white flex items-center justify-center shadow-sm">
-              <div className="text-[#001B5E] font-extrabold text-lg leading-none">r</div>
-            </div>
+          {/* Simple “R” mark (no ®) */}
+          <div className="w-10 h-10 rounded-2xl bg-white flex items-center justify-center shadow-sm">
+            <span className="text-2xl font-extrabold" style={{ color: REMITLY_NAVY }}>
+              R
+            </span>
+          </div>
 
-            <div className="flex flex-col">
-              <div className="text-2xl font-semibold text-white">Remitly Treasury</div>
-              <h1 className="text-2xl font-semibold text-white">FRD Book Management 101</h1>
-            </div>
+          <div className="flex flex-col">
+            <div className="text-2xl font-semibold text-white">Remitly Treasury</div>
+            <h1 className="text-2xl font-semibold text-white">FRD Book Management 101</h1>
           </div>
 
           <div className="ml-auto flex items-center gap-2 flex-wrap justify-end">
@@ -1691,11 +1601,8 @@ export default function Page() {
             </button>
 
             <button
-              onClick={() => {
-                const context: "basic" | "guided" | "manual" = tab === "guided" ? "guided" : tab === "manual" ? "manual" : "basic";
-                openRollModal(context);
-              }}
-              className="px-4 py-2 rounded-xl text-sm font-semibold bg-white text-slate-900 hover:bg-white/90 transition"
+              onClick={rollButtonClicked}
+              className="px-4 py-2 rounded-xl text-sm font-semibold bg-white text-slate-900 hover:bg-white/90 transition rounded-xl"
               title="Roll value date (nets t+1 into t+0 and shifts horizon)."
             >
               Roll Value Date
@@ -1707,8 +1614,9 @@ export default function Page() {
         {tab === "home" ? (
           <div className="space-y-4">
             <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6">
-              <div className="text-xl font-extrabold text-slate-900">What this tool is</div>
-              <p className="mt-3 text-sm font-semibold text-slate-800 leading-relaxed">
+              {/* Removed “What this tool is” heading */}
+
+              <p className="text-sm font-semibold text-slate-800 leading-relaxed">
                 This simulator is a hands-on training tool for learning how FX swaps change cash positions over a rolling value-date horizon. The blotter is shown in “cashflow view”:{" "}
                 <span className="font-bold">t+0 is cash at bank plus executed trades</span>, and <span className="font-bold">t+1..t+14</span> are net cashflows expected on those dates.
               </p>
@@ -1718,11 +1626,11 @@ export default function Page() {
                   <div className="text-sm font-extrabold text-slate-900">Your objective</div>
                   <ul className="mt-2 list-disc ml-5 text-sm font-semibold text-slate-800 space-y-1">
                     <li>
-                      Square all <span className="font-bold">non-USD</span> <span className="font-bold">t+0</span> positions within{" "}
-                      <span className="font-bold">±$5m USD-equivalent</span>.
+                      For every <span className="font-bold">non-USD</span> currency, make <span className="font-bold">t+0</span>{" "}
+                      <span className="font-bold">LONG</span> between <span className="font-bold">$0 and $5m USD-equivalent</span>.
                     </li>
                     <li>USD is exempt (but remains large and positive).</li>
-                    <li>Blotter values are shown in native currency; the objective uses USD-equivalent.</li>
+                    <li>MXN and PHP must be long (covered by the rule above).</li>
                   </ul>
                 </div>
 
@@ -1733,7 +1641,7 @@ export default function Page() {
                       Start in <span className="font-bold">Basic</span>: decide Execute vs Reject for one suggestion at a time.
                     </li>
                     <li>
-                      Move to <span className="font-bold">Guided</span>: choose among multiple swaps (including crosses) and learn trade-offs.
+                      Move to <span className="font-bold">Guided</span>: choose among 4 swaps and learn trade-offs.
                     </li>
                     <li>
                       Graduate to <span className="font-bold">Manual</span>: you build swaps yourself using a trader-style entry.
@@ -1742,44 +1650,23 @@ export default function Page() {
                 </div>
               </div>
 
-              <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                <div className="text-sm font-extrabold text-slate-900">Markets explainer</div>
-
-                <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-4">
-                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                    <div className="text-sm font-extrabold text-slate-900">Spot FX</div>
-                    <div className="mt-2 text-sm font-semibold text-slate-800">
-                      <span className="font-bold">Spot</span> is the price for exchanging two currencies for near settlement.
-                      In this trainer, we use spot to value the near leg and show the immediate impact on <span className="font-bold">t+0</span> positions.
-                    </div>
-                  </div>
-
-                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                    <div className="text-sm font-extrabold text-slate-900">Forward FX</div>
-                    <div className="mt-2 text-sm font-semibold text-slate-800">
-                      <span className="font-bold">Forwards</span> lock in an exchange rate for a future date. The forward differs from spot because of the{" "}
-                      <span className="font-bold">interest rate differential</span> between the two currencies.
-                    </div>
-                  </div>
-
-                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                    <div className="text-sm font-extrabold text-slate-900">Forward points</div>
-                    <div className="mt-2 text-sm font-semibold text-slate-800">
-                      <span className="font-bold">Forward points</span> are simply: <span className="font-bold">Forward − Spot</span>. Dealers often quote points rather than the outright forward.
-                      In this app we compute a simple forward using IRs and add a small <span className="font-bold">1.5bp</span> spread to points so it’s not free to round-trip.
-                    </div>
-                  </div>
-
-                  <div className="rounded-2xl border border-slate-200 bg-white p-4">
-                    <div className="text-sm font-extrabold text-slate-900">Carry</div>
-                    <div className="mt-2 text-sm font-semibold text-slate-800">
-                      <span className="font-bold">Carry</span> is the P&L you earn/pay from holding currency funding over time (via the IR differential, reflected in forward points).
-                      In swaps, carry shows up as the difference between the near and far exchange amounts.
-                    </div>
+              <div className="mt-5 grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="text-sm font-extrabold text-slate-900">Basic tab</div>
+                  <div className="mt-2 text-sm font-semibold text-slate-800">
+                    One swap at a time. Your job is to decide if it helps today’s funding objective at <span className="font-bold">t+0</span>.
                   </div>
                 </div>
 
-                {/* Removed entire “Ask a question…” section per request */}
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="text-sm font-extrabold text-slate-900">Guided tab</div>
+                  <div className="mt-2 text-sm font-semibold text-slate-800">Pick from 4 swaps (1 best, 1 marginal, 2 worse). Always solvable within 15 swaps.</div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="text-sm font-extrabold text-slate-900">Manual tab</div>
+                  <div className="mt-2 text-sm font-semibold text-slate-800">Enter a swap ticket like a trader. Toggle whether you buy Currency 1 or sell Currency 1 on the near leg.</div>
+                </div>
               </div>
             </div>
 
@@ -1797,7 +1684,11 @@ export default function Page() {
           <div className="space-y-4">
             <Banner dayNumber={dayNumber} />
             <div className="space-y-2">
-              <Blotter scenario={displayScenario} highlightCells={tab === "basic" ? basicIncorrect.changedCells : undefined} prevValues={tab === "basic" ? basicIncorrect.prevValues : undefined} />
+              <Blotter
+                scenario={displayScenario}
+                highlightCells={tab === "basic" ? basicIncorrect.changedCells : undefined}
+                prevValues={tab === "basic" ? basicIncorrect.prevValues : undefined}
+              />
               {objectiveBanner}
             </div>
           </div>
@@ -1807,16 +1698,15 @@ export default function Page() {
         {tab === "basic" ? (
           <div className="space-y-4">
             <div className="flex flex-wrap items-center gap-3">
-              <Pill label="Solved (USD-equiv)" value={solvedNowUsdEq ? "✅ Yes" : "No"} />
-              <Pill label="Basic accuracy" value={`${basicCorrect} / ${basicTotal}`} />
-              <Pill label="Moves left (planned)" value={basicMovesLeft} />
+              <Pill label="Solved (current state)" value={solvedNow ? "✅ Yes" : "No"} />
+              <Pill label="Swaps traded (correct executions)" value={swapsTradedCorrectExecuted} />
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white shadow-sm p-5">
               <div className="flex items-start justify-between gap-3">
                 <div className="text-sm font-semibold text-slate-900">
-                  Decide whether to <span className="font-bold">Execute</span> or <span className="font-bold">Reject</span> based on what it does to{" "}
-                  <span className="font-bold">t+0</span> (USD-equivalent squaring).
+                  Decide whether to <span className="font-bold">Execute</span> or <span className="font-bold">Reject</span> based on your objective to solve for today&apos;s funding needs{" "}
+                  <span className="font-bold">(t+0)</span>.
                 </div>
 
                 {basicIncorrect.active ? (
@@ -1832,8 +1722,7 @@ export default function Page() {
                         Buy {basicSuggestion.buyCcy} / Sell {basicSuggestion.sellCcy}
                       </div>
                       <div className="text-sm font-semibold text-slate-900">
-                        Notional: {formatM(basicSuggestion.notionalBuy)} {basicSuggestion.buyCcy}{" "}
-                        <span className="text-slate-600">· Counter (near): {formatM(counterAmountNear(basicSuggestion))} {basicSuggestion.sellCcy}</span>
+                        Notional: {formatM(basicSuggestion.notionalBuy)} {basicSuggestion.buyCcy}
                       </div>
                       <div className="text-sm font-semibold text-slate-900">
                         Near: t+{basicSuggestion.nearOffset} · Far: t+{basicSuggestion.farOffset} (Near always t+0)
@@ -1877,9 +1766,7 @@ export default function Page() {
                       ) : null}
                     </div>
                   ) : (
-                    <div className="text-sm font-semibold text-slate-700">
-                      {rates.status === "loading" ? "Loading rates…" : rates.status === "error" ? `Rates error: ${rates.error}` : "No plan loaded yet."}
-                    </div>
+                    <div className="text-sm font-semibold text-slate-700">{rates.status === "loading" ? "Loading rates…" : rates.status === "error" ? `Rates error: ${rates.error}` : "No suggestion."}</div>
                   )}
                 </div>
 
@@ -1894,7 +1781,7 @@ export default function Page() {
             </div>
 
             {costPanel}
-            <div>{fxRatesPanel}</div>
+            <div>{ratesMatrixPanel}</div>
           </div>
         ) : null}
 
@@ -1903,141 +1790,84 @@ export default function Page() {
           <div className="space-y-4">
             <div className="flex flex-wrap items-center gap-3">
               <Pill label="Swaps left" value={swapsLeft} />
-              <Pill label="Score (out of 100)" value={guidedScore} />
+              <Pill label="Score" value={guidedScore} />
+              {solvedPreviewOrNow ? (
+                <div className="px-4 py-3 rounded-2xl bg-emerald-100 text-emerald-900 font-bold text-sm border border-emerald-200">✅ Solved (t+0 within objective)</div>
+              ) : null}
 
               <button
-                onClick={undoLastGuidedTrade}
-                disabled={guidedHistory.length === 0}
-                className={classNames(
-                  "px-4 py-3 rounded-2xl text-sm font-extrabold border transition",
-                  guidedHistory.length === 0 ? "border-slate-200 bg-slate-200 text-slate-500" : "border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
-                )}
+                onClick={() => undoLastTrade("guided")}
+                className="ml-auto px-4 py-3 rounded-2xl text-sm font-bold bg-white text-slate-900 hover:bg-white/90 transition border border-white/30"
+                title="Undo last guided trade (removes it from cost tracker)."
               >
                 Undo Last Trade
               </button>
-
-              {guidedSolvedUsdEq ? (
-                <div className="px-4 py-3 rounded-2xl bg-emerald-100 text-emerald-900 font-bold text-sm border border-emerald-200">
-                  ✅ Solved (non-USD t+0 within ±$5m USD-equiv)
-                </div>
-              ) : null}
             </div>
 
-            <div className="text-lg font-semibold text-white">Choose an FX swap (USD + crosses)</div>
+            <div className="text-lg font-semibold text-white">Choose an FX swap (4 options)</div>
 
-            {guidedReversalPrompt ? (
-              <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4">
-                <div className="text-sm font-extrabold text-slate-900">This went the wrong way, execute a reversal?</div>
-                <div className="mt-2 flex gap-2">
-                  <button
-                    onClick={() => {
-                      // YES: revert blotter to before, but keep original trade in cost tracker and add reversal entry
-                      const { before, trade } = guidedReversalPrompt;
-                      const rev = makeReversalTrade(trade);
-                      setScenario(before);
-                      setGuidedReversalPrompt(null);
-                      setSelected(null);
-                      setPreviewScenario(null);
-
-                      if (rev) {
-                        logTrade(rev, {
-                          correct: undefined,
-                          mode: "guided",
-                          labelOverride: `REVERSAL · Buy ${rev.buyCcy} / Sell ${rev.sellCcy} · ${formatM(rev.notionalBuy)} ${rev.buyCcy}`,
-                        });
-                      }
-                      // Do NOT change guidedStep (reversal does not consume extra “swaps left”)
-                    }}
-                    className="px-4 py-3 rounded-2xl text-sm font-extrabold bg-slate-900 text-white hover:bg-slate-800 transition"
-                  >
-                    Yes
-                  </button>
-                  <button
-                    onClick={() => setGuidedReversalPrompt(null)}
-                    className="px-4 py-3 rounded-2xl text-sm font-extrabold border border-slate-200 bg-white text-slate-900 hover:bg-slate-50 transition"
-                  >
-                    No
-                  </button>
-                </div>
-              </div>
-            ) : null}
-
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
-              {guidedTiles.map((t) => {
-                const counter = counterAmountNear(t);
-                return (
-                  <div key={t.id} className="rounded-2xl border border-slate-200 bg-white shadow-sm p-4 flex flex-col gap-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="font-semibold text-slate-900 truncate">
-                          Buy {t.buyCcy} / Sell {t.sellCcy}
-                        </div>
-                        <div className="text-sm text-slate-900 font-semibold mt-1">
-                          Notional: {formatM(t.notionalBuy)} {t.buyCcy}
-                        </div>
-                        <div className="text-sm text-slate-900 font-semibold">
-                          Counter (near): {formatM(counter)} {t.sellCcy}
-                        </div>
-                        <div className="text-sm text-slate-900 font-semibold">
-                          Near: t+{t.nearOffset} · Far: t+{t.farOffset}
-                        </div>
-                        <div className="text-xs text-slate-900 font-semibold mt-1">USD carry (approx): {t.usdCost === null ? "—" : `$${formatInt(t.usdCost)}`}</div>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-2 gap-3">
+              {guidedTiles.map((t) => (
+                <div key={t.id} className="rounded-2xl border border-slate-200 bg-white shadow-sm p-4 flex flex-col gap-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="font-semibold text-slate-900 truncate">
+                        Buy {t.buyCcy} / Sell {t.sellCcy}
                       </div>
-                      {revealed.has(t.id) ? (
-                        <div
-                          className={classNames(
-                            "text-xs px-2 py-1 rounded-lg font-semibold",
-                            t.category === "Best" ? "bg-emerald-100 text-emerald-900" : t.category === "Marginal" ? "bg-amber-100 text-amber-900" : "bg-rose-100 text-rose-900"
-                          )}
-                        >
-                          {t.category} ({t.scoreDelta > 0 ? `+${t.scoreDelta}` : t.scoreDelta})
-                        </div>
-                      ) : null}
+
+                      <div className="text-sm text-slate-900 font-semibold mt-1">
+                        Notional: {formatM(t.notionalBuy)} {t.buyCcy}{" "}
+                        <span className="text-slate-500 font-bold">·</span> Counter: <span className="font-extrabold">{t.counterAmountLabel}</span>
+                      </div>
+
+                      <div className="text-sm text-slate-900 font-semibold">
+                        Near: t+{t.nearOffset} · Far: t+{t.farOffset}
+                      </div>
+
+                      <div className="text-xs text-slate-900 font-semibold mt-1">USD carry (approx): {t.usdCost === null ? "—" : `$${formatInt(t.usdCost)}`}</div>
                     </div>
 
-                    <div className="flex gap-2">
-                      {previewEnabled ? (
-                        <button
-                          onClick={() => previewGuided(t)}
-                          className="flex-1 px-3 py-2 rounded-xl text-sm font-semibold border border-slate-200 bg-white hover:bg-slate-50 transition text-slate-900"
-                        >
-                          Preview
-                        </button>
-                      ) : null}
-
-                      <button
-                        onClick={() => {
-                          executeGuided(t);
-                          setRevealed((prev) => {
-                            const n = new Set(prev);
-                            n.add(t.id);
-                            return n;
-                          });
-                        }}
-                        className={classNames("px-3 py-2 rounded-xl text-sm font-semibold bg-slate-900 text-white hover:bg-slate-800 transition", previewEnabled ? "flex-1" : "w-full")}
+                    {guidedReveal.has(t.id) ? (
+                      <div
+                        className={classNames(
+                          "text-xs px-2 py-1 rounded-lg font-semibold",
+                          t.category === "Best" ? "bg-emerald-100 text-emerald-900" : t.category === "Marginal" ? "bg-amber-100 text-amber-900" : "bg-rose-100 text-rose-900"
+                        )}
                       >
-                        Execute
-                      </button>
-                    </div>
-
-                    {revealed.has(t.id) ? <div className="text-sm font-semibold text-slate-900">{t.why}</div> : null}
+                        {t.category} ({t.scoreDelta > 0 ? `+${t.scoreDelta}` : t.scoreDelta})
+                      </div>
+                    ) : null}
                   </div>
-                );
-              })}
+
+                  <div className="flex gap-2">
+                    {previewEnabled ? (
+                      <button onClick={() => previewGuided(t)} className="flex-1 px-3 py-2 rounded-xl text-sm font-semibold border border-slate-200 bg-white hover:bg-slate-50 transition text-slate-900">
+                        Preview
+                      </button>
+                    ) : null}
+
+                    <button onClick={() => executeGuided(t)} className={classNames("px-3 py-2 rounded-xl text-sm font-semibold bg-slate-900 text-white hover:bg-slate-800 transition", previewEnabled ? "flex-1" : "w-full")}>
+                      Execute
+                    </button>
+                  </div>
+
+                  <div className="text-sm font-semibold text-slate-900">{t.why}</div>
+                </div>
+              ))}
             </div>
 
-            {selected ? (
+            {guidedSelected ? (
               <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4">
                 <div className="text-sm font-semibold text-slate-900">Last trade</div>
                 <div className="text-lg font-bold text-slate-900 mt-1">
-                  Buy {selected.buyCcy} / Sell {selected.sellCcy} · Near t+{selected.nearOffset} · Far t+{selected.farOffset}
+                  Buy {guidedSelected.buyCcy} / Sell {guidedSelected.sellCcy} · Near t+{guidedSelected.nearOffset} · Far t+{guidedSelected.farOffset}
                 </div>
-                <div className="text-sm font-semibold text-slate-900 mt-2">{selected.why}</div>
+                <div className="text-sm font-semibold text-slate-900 mt-2">{guidedSelected.why}</div>
               </div>
             ) : null}
 
             {costPanel}
-            <div>{fxRatesPanel}</div>
+            <div>{ratesMatrixPanel}</div>
           </div>
         ) : null}
 
@@ -2207,7 +2037,10 @@ export default function Page() {
                       Preview
                     </button>
 
-                    <button onClick={() => setManualPreview(null)} className="px-4 py-3 rounded-2xl text-sm font-bold border border-slate-200 bg-white hover:bg-slate-50 transition text-slate-900">
+                    <button
+                      onClick={() => setManualPreview(null)}
+                      className="px-4 py-3 rounded-2xl text-sm font-bold border border-slate-200 bg-white hover:bg-slate-50 transition text-slate-900"
+                    >
                       Clear manual preview
                     </button>
                   </>
@@ -2217,19 +2050,37 @@ export default function Page() {
                   onClick={() => {
                     const t = buildTradeFromManual();
                     if (!t) return;
-                    setScenario((s) => applyFxSwap(s, t));
-                    logTrade(t, { mode: "manual" });
+                    const before = scenario;
+                    const after = applyFxSwap(before, t);
+                    setScenario(after);
+
+                    const logId = logTrade(t, undefined, "manual");
+                    pushHistory(before, t, logId, "manual");
+
                     setManualPreview(null);
+
+                    // auto-roll if solved in manual
+                    if (ratesRef.current.status === "ok" && solvedT0Long0to5mUsdEq(after.balances, ratesRef.current)) {
+                      rollDayWithMessage("Well done, the value date will now roll.");
+                    }
                   }}
                   className="px-4 py-3 rounded-2xl text-sm font-bold bg-slate-900 text-white hover:bg-slate-800 transition"
                 >
                   Execute
                 </button>
+
+                <button
+                  onClick={() => undoLastTrade("manual")}
+                  className="ml-auto px-4 py-3 rounded-2xl text-sm font-bold bg-white text-slate-900 hover:bg-white/90 transition border border-slate-200"
+                  title="Undo last manual trade (removes it from cost tracker)."
+                >
+                  Undo Last Trade
+                </button>
               </div>
             </div>
 
             {costPanel}
-            <div>{fxRatesPanel}</div>
+            <div>{ratesMatrixPanel}</div>
           </div>
         ) : null}
       </div>
