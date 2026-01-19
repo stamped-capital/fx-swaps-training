@@ -1743,4 +1743,6 @@ const dayResultsPanel = (
     </div>
   </div>
 );
+  // end of component — make sure the function is closed
+}
 
