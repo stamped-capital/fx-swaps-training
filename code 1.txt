@@ -1,11 +1,11 @@
-code = r'''"use client";
+"use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * FX Swaps Training Tool — Single-file Page (Next.js App Router)
  *
- * Key rules:
+ * Key rules (updated):
  * - Objective (SOLVED): for EVERY non-USD currency, t+0 USD-equivalent must be LONG in [0 .. +5m].
  *   - (So: no shorts, and no idle long > +5m USD-equivalent)
  *
@@ -14,34 +14,43 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * - But SOLVED checks and swap sizing limits use USD-equivalent.
  * - For JPY/MXN/PHP: allow up to 100m USD-equivalent on generation/capping (so PHP/JPY can look “large” in local units).
  *
- * Basic game:
+ * Basic game (updated):
  * - Never offer swaps < 2m USD-equivalent or > 100m USD-equivalent.
- * - Never suggest more than 3 incorrect swaps in a day.
- * - Score: correct choices / total choices (shown top + progress + completion modal).
+ * - “Swaps traded” counts ONLY correct executed trades (correct rejects do not count).
+ * - Never suggest more than 3 incorrect swaps in a day (so the day stays solvable in a decent time).
+ * - Score: correct choices / total choices.
  * - Track daily scores + daily costs vs a best-possible cost target.
  *
- * Guided game:
+ * Guided game (updated):
  * - Always show exactly 4 tiles:
- *    - 1 Best, 1 Marginal, 2 Worse
- * - Option tiles are randomized deterministically so Best isn’t always in one spot.
- * - Scoring is correct/total where correct = Best or Marginal.
- * - Grading is NOT shown immediately — click Reveal after an execution to see Best/Marginal/Worse + why.
- * - If a swap clearly went the wrong way, prompt: “Bad Swap Execution - Trade a Reversal?” (Yes/No side-by-side).
- *   - Yes = redo that execution (reverts blotter impact, adds REVERSAL log, does not refund step)
- *   - No = accept and move on
+ *    - 1 Best: solves one exposure into [0..5m] USD-equivalent long
+ *    - 1 Marginal: moves toward solution but ~50% as good
+ *    - 2 Worse: make positions worse
+ * - Always solvable within 15 swaps; after each execute, regenerate a fresh set of 4 tiles.
+ * - Has “Undo Last Trade” button (reverts last executed trade and removes it from the log).
+ * - When a swap clearly went the wrong way, prompt: “Bad Swap Execution - Trade a Reversal?” (Yes/No side-by-side).
+ *   - If Yes: undo blotter impact, but keep original trade in cost tracker and add a “REVERSAL” trade entry. Does NOT refund swaps left.
+ * - Scoring is the same as Basic (correct / total), where correct = Best or Marginal.
+ *   - End-of-day adds: % of correct executions that were Marginal vs Best.
+ * - Do not reveal Best/Marginal/Worse labels inside tiles until AFTER the tile is executed.
  *
- * Closing completion modal advances the day/value date in both basic + guided.
+ * UI / branding (updated):
+ * - Dark navy background matching Remitly logo color (#212E61).
+ * - Header text is white; add a simple Remitly “R” mark (no ®).
+ * - Under-blotter rules text is white on all pages for legibility.
+ * - Remove “Clear preview” from cost tracker (it did nothing).
+ * - FX rates displayed as a cross-rate matrix (4dp, except MXN & PHP at 2dp).
  */
 
 type Ccy = string;
 
-// Alphabetical order for blotter.
+// Alphabetical order (as requested for blotter). Removed SEK/NOK, added MXN/PHP.
 const CCYS: Ccy[] = ["AUD", "CAD", "CHF", "EUR", "GBP", "JPY", "MXN", "NZD", "PHP", "USD"];
 
 const HORIZON = 15; // t+0..t+14
 const MAX_DAYS = 80;
 
-const TOL_USD_EQ = 5_000_000;
+const TOL_USD_EQ = 5_000_000; // SOLVED upper bound in USD equivalent
 const USD_MIN_ROW_TOTAL = 300_000_000;
 
 const NONUSD_ROW_TOTAL_MIN = 1;
@@ -51,13 +60,14 @@ const USD_BASE_LONG = 300_000_000;
 
 const BASIC_MAX_STEPS = 30;
 const BASIC_MIN_STEPS = 15;
-const BASIC_MAX_BAD_SUGGESTIONS = 3;
+// Never suggest more than 3 incorrect swaps.
+const BASIC_REQUIRED_BAD = 3;
 
 const GUIDED_MAX_STEPS = 15;
 
-const FWD_POINTS_SPREAD_BP = 1.5;
+const FWD_POINTS_SPREAD_BP = 1.5; // basis points
 
-// Remitly navy.
+// Remitly navy (from logo color extraction).
 const REMITLY_NAVY = "#212E61";
 
 // Simplified “static” IR assumptions (annualized).
@@ -90,41 +100,24 @@ function classNames(...xs: Array<string | false | undefined | null>) {
   return xs.filter(Boolean).join(" ");
 }
 
-/** Deterministic RNG (Mulberry32) */
-function mulberry32(seed: number) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-function deterministicShuffle<T>(arr: T[], seed: number): T[] {
-  const r = mulberry32(seed);
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(r() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
 const nfInt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 function formatInt(n: number) {
   return nfInt.format(Math.round(n));
 }
+
 function formatM(n: number) {
   const sign = n < 0 ? "-" : "";
   const abs = Math.abs(n);
   const m = abs / 1_000_000;
   return `${sign}${m.toFixed(1)}m`;
 }
+
 function fmtRate(n: number, ccy: Ccy) {
+  // Show MXN & PHP to 2dp; others 4dp
   const dp = ccy === "MXN" || ccy === "PHP" ? 2 : 4;
   return Number.isFinite(n) ? n.toFixed(dp) : "—";
 }
+
 function formatWithCommasDigitsOnly(raw: string) {
   const digits = raw.replace(/[^\d]/g, "");
   if (!digits) return "";
@@ -134,6 +127,7 @@ function parseCommaNumber(s: string) {
   const n = Number(String(s ?? "").replace(/,/g, "").trim());
   return Number.isFinite(n) ? n : NaN;
 }
+
 function cellClass(v: number) {
   if (v > 0) return "bg-emerald-100 text-emerald-950";
   if (v < 0) return "bg-rose-100 text-rose-950";
@@ -211,10 +205,11 @@ function applyFxSwap(s: Scenario, t: SwapTrade): Scenario {
 }
 
 function invertTrade(t: SwapTrade): SwapTrade {
+  // opposite direction, same tenors and amounts
   return {
     buyCcy: t.sellCcy,
     sellCcy: t.buyCcy,
-    notionalBuy: Math.round(t.notionalBuy * t.spot),
+    notionalBuy: Math.round(t.notionalBuy * t.spot), // approximate: buy amount in opposite direction
     nearOffset: t.nearOffset,
     farOffset: t.farOffset,
     spot: 1 / t.spot,
@@ -289,6 +284,7 @@ function makeEmptyRates(): UsdRates {
 }
 
 function spotFromUsdRates(buyCcy: Ccy, sellCcy: Ccy, rates: UsdRates) {
+  // returns sell per buy
   if (buyCcy === sellCcy) return 1;
   const ub = rates.usdPerCcy[buyCcy];
   const us = rates.usdPerCcy[sellCcy];
@@ -316,6 +312,7 @@ function usdEqT0(bal: Record<Ccy, number>, rates: UsdRates): Record<Ccy, number>
 }
 
 function solvedT0Long0to5mUsdEq(bal: Record<Ccy, number>, rates: UsdRates) {
+  // Non-USD must be LONG and between 0 and +5m USD eq.
   for (const c of CCYS) {
     if (c === "USD") continue;
     const u = toUsd(bal[c] ?? 0, c, rates);
@@ -327,6 +324,7 @@ function solvedT0Long0to5mUsdEq(bal: Record<Ccy, number>, rates: UsdRates) {
 }
 
 function t0BadnessUsdEq(bal: Record<Ccy, number>, rates: UsdRates) {
+  // Lower is better. Penalize shorts heavily + excess idle cash.
   let e = 0;
   for (const c of CCYS) {
     if (c === "USD") continue;
@@ -364,6 +362,7 @@ function generateScenarioRaw(): Scenario {
 }
 
 function capScenarioToUsdEq(s: Scenario, rates: UsdRates): Scenario {
+  // Cap t+0 USD-equivalent sizes so JPY/MXN/PHP can be bigger (up to 100m USD eq), others ~80m.
   const out = shallowCopyScenario(s);
   if (rates.status !== "ok") return out;
 
@@ -421,14 +420,14 @@ function makeSwapVsUsdToTargetOneCcy(
   s: Scenario,
   rates: UsdRates,
   ccy: Ccy,
-  targetUsdEq: number,
+  targetUsdEq: number, // between 0..5m
   farOffset: number
 ): SwapTrade | null {
   if (ccy === "USD") return null;
   const curUsd = toUsd(s.balances[ccy] ?? 0, ccy, rates);
   if (!Number.isFinite(curUsd)) return null;
 
-  const deltaUsd = targetUsdEq - curUsd;
+  const deltaUsd = targetUsdEq - curUsd; // if positive => need more long (buy ccy)
   const nearOffset = 0;
   let buyCcy: Ccy;
   let notionalBuy: number;
@@ -439,9 +438,10 @@ function makeSwapVsUsdToTargetOneCcy(
     if (!Number.isFinite(usdPer) || usdPer <= 0) return null;
     notionalBuy = Math.round(deltaUsd / usdPer);
   } else {
+    // reduce long / fix short: buy USD, sell ccy
     buyCcy = "USD";
     const wantReduceUsd = Math.abs(deltaUsd);
-    notionalBuy = Math.round(wantReduceUsd);
+    notionalBuy = Math.round(wantReduceUsd); // notionalBuy in USD
   }
 
   const buy = buyCcy;
@@ -450,7 +450,16 @@ function makeSwapVsUsdToTargetOneCcy(
   if (!sp) return null;
   const fw = forwardFromSpot(sp, buy, sell, Math.max(1, farOffset - nearOffset));
 
-  const t: SwapTrade = { buyCcy: buy, sellCcy: sell, notionalBuy, nearOffset, farOffset, spot: sp, fwd: fw };
+  const t: SwapTrade = {
+    buyCcy: buy,
+    sellCcy: sell,
+    notionalBuy,
+    nearOffset,
+    farOffset,
+    spot: sp,
+    fwd: fw,
+  };
+
   return clampNotionalBuyToUsdEq(t, rates);
 }
 
@@ -469,6 +478,7 @@ function makeBadSwapDifferentPair(s: Scenario, rates: UsdRates, avoidPair: strin
     const sp = spotFromUsdRates(buyCcy, sellCcy, rates) ?? 1;
     const fw = forwardFromSpot(sp, buyCcy, sellCcy, Math.max(1, farOffset - nearOffset));
 
+    // choose notional so it's within [2m..100m] USD eq (based on buy ccy)
     const usdPer = rates.usdPerCcy[buyCcy];
     if (!Number.isFinite(usdPer) || usdPer <= 0) continue;
     const targetUsd = rand(MIN_SWAP_USD_EQ, Math.min(25_000_000, MAX_SWAP_USD_EQ));
@@ -478,6 +488,7 @@ function makeBadSwapDifferentPair(s: Scenario, rates: UsdRates, avoidPair: strin
     const clamped = clampNotionalBuyToUsdEq(t, rates);
     if (!clamped) continue;
 
+    // ensure it is "bad" by checking it worsens badness
     const after = applyFxSwap(s, clamped);
     if (t0BadnessUsdEq(after.balances, rates) > t0BadnessUsdEq(s.balances, rates)) return clamped;
   }
@@ -486,15 +497,17 @@ function makeBadSwapDifferentPair(s: Scenario, rates: UsdRates, avoidPair: strin
 }
 
 function buildBasicPlanForDay(startScenario: Scenario, rates: UsdRates): BasicSuggestion[] {
+  // Plan: create a sequence that becomes SOLVED if user executes all good and rejects all bad.
+  // Ensure at most BASIC_REQUIRED_BAD bad suggestions.
   const plan: BasicSuggestion[] = [];
   let s = shallowCopyScenario(startScenario);
 
   const farChoices = [2, 3, 5, 7];
 
-  // 1) add up to 3 bad suggestions
+  // 1) add up to BASIC_REQUIRED_BAD bad suggestions early
   let lastBadPair: string | null = null;
   let badCount = 0;
-  for (let i = 0; i < BASIC_MAX_BAD_SUGGESTIONS; i++) {
+  for (let i = 0; i < BASIC_REQUIRED_BAD; i++) {
     const bad = makeBadSwapDifferentPair(s, rates, lastBadPair);
     if (!bad) break;
     lastBadPair = `${bad.buyCcy}/${bad.sellCcy}`;
@@ -503,7 +516,7 @@ function buildBasicPlanForDay(startScenario: Scenario, rates: UsdRates): BasicSu
     badCount++;
   }
 
-  // 2) solve each currency vs USD
+  // 2) solve each currency vs USD as needed
   const targetMid = 2_500_000;
   for (let guard = 0; guard < 200; guard++) {
     if (plan.length >= BASIC_MAX_STEPS) break;
@@ -527,18 +540,23 @@ function buildBasicPlanForDay(startScenario: Scenario, rates: UsdRates): BasicSu
     const t = makeSwapVsUsdToTargetOneCcy(s, rates, pick.c, clamp(targetMid, 0, TOL_USD_EQ), far);
     if (!t) break;
 
+    // Ensure isGood (actually improves)
     const after = applyFxSwap(s, t);
-    if (t0BadnessUsdEq(after.balances, rates) >= t0BadnessUsdEq(s.balances, rates)) continue;
+    if (t0BadnessUsdEq(after.balances, rates) >= t0BadnessUsdEq(s.balances, rates)) {
+      continue;
+    }
 
     const usdC = swapUsdCost({ notionalBuy: t.notionalBuy, spot: t.spot, fwd: t.fwd, sellCcy: t.sellCcy }, rates);
     plan.push({ id: id(), ...t, isGood: true, usdCost: Number.isFinite(usdC) ? usdC : null });
 
+    // simulate “correct” path: good trades get executed
     s = after;
   }
 
-  // 3) pad to minimum steps WITHOUT exceeding 3 bad suggestions
+  // 3) pad with additional bad suggestions ONLY if we still haven't hit BASIC_MIN_STEPS and haven't hit bad cap
+  // (Keeps the day moving, but never exceeds 3 bad suggestions.)
   let avoid = lastBadPair;
-  while (plan.length < BASIC_MIN_STEPS && plan.length < BASIC_MAX_STEPS && badCount < BASIC_MAX_BAD_SUGGESTIONS) {
+  while (plan.length < BASIC_MIN_STEPS && plan.length < BASIC_MAX_STEPS && badCount < BASIC_REQUIRED_BAD) {
     const bad = makeBadSwapDifferentPair(s, rates, avoid);
     if (!bad) break;
     avoid = `${bad.buyCcy}/${bad.sellCcy}`;
@@ -564,21 +582,23 @@ function computeBestPossibleCostBasic(plan: BasicSuggestion[]) {
 type GuidedTile = SwapTrade & {
   id: string;
   category: "Best" | "Marginal" | "Worse";
-  usdCost: number | null;
+  scoreDelta: 10 | 5 | -5;
   why: string;
-  counterAmountLabel: string;
+  usdCost: number | null;
+  counterAmountLabel: string; // e.g. "≈ 31.2m USD"
 };
 
-function makeGuidedTile(rates: UsdRates, t: SwapTrade, category: GuidedTile["category"], why: string): GuidedTile {
+function makeGuidedTile(rates: UsdRates, t: SwapTrade, category: GuidedTile["category"], scoreDelta: GuidedTile["scoreDelta"], why: string): GuidedTile {
   const usdC = swapUsdCost({ notionalBuy: t.notionalBuy, spot: t.spot, fwd: t.fwd, sellCcy: t.sellCcy }, rates);
-  const counterNear = Math.round(t.notionalBuy * t.spot);
+  const counterNear = Math.round(t.notionalBuy * t.spot); // sellCcy amount (abs) on near
   const counterLabel = `${formatM(counterNear)} ${t.sellCcy}`;
   return {
     id: id(),
     ...t,
     category,
-    usdCost: Number.isFinite(usdC) ? usdC : null,
+    scoreDelta,
     why,
+    usdCost: Number.isFinite(usdC) ? usdC : null,
     counterAmountLabel: counterLabel,
   };
 }
@@ -595,15 +615,17 @@ function pickWorstNonUsdByUsdEq(bal: Record<Ccy, number>, rates: UsdRates) {
   return best;
 }
 
-function buildGuidedFourTiles(s: Scenario, rates: UsdRates, seed: number): GuidedTile[] {
+function buildGuidedFourTiles(s: Scenario, rates: UsdRates): GuidedTile[] {
   const farOffset = 2;
   const targetMid = 2_500_000;
 
   const worst = pickWorstNonUsdByUsdEq(s.balances, rates);
   const focus = worst?.c ?? "EUR";
 
+  // BEST: bring focus into [0..5m] (aim ~2.5m)
   const bestTrade = makeSwapVsUsdToTargetOneCcy(s, rates, focus, clamp(targetMid, 0, TOL_USD_EQ), farOffset);
 
+  // If for some reason we can't, fall back to a random USD pair
   const fallback = () => {
     const buyCcy = pickOne(CCYS.filter((c) => c !== "USD"));
     const sellCcy = "USD";
@@ -617,9 +639,14 @@ function buildGuidedFourTiles(s: Scenario, rates: UsdRates, seed: number): Guide
   const best = bestTrade ?? fallback();
   if (!best) return [];
 
-  const marginalBase: SwapTrade = { ...best, notionalBuy: Math.max(1, Math.round(best.notionalBuy * 0.5)) };
-  const marginal = clampNotionalBuyToUsdEq(marginalBase, rates) ?? marginalBase;
+  // MARGINAL: ~half size in same direction
+  const marginal: SwapTrade = {
+    ...best,
+    notionalBuy: Math.max(1, Math.round(best.notionalBuy * 0.5)),
+  };
+  const marginalClamped = clampNotionalBuyToUsdEq(marginal, rates) ?? marginal;
 
+  // WORSE 1: opposite direction same pair similar size
   const worse1Base: SwapTrade = {
     ...best,
     buyCcy: best.sellCcy,
@@ -630,25 +657,28 @@ function buildGuidedFourTiles(s: Scenario, rates: UsdRates, seed: number): Guide
   };
   const worse1 = clampNotionalBuyToUsdEq(worse1Base, rates) ?? worse1Base;
 
+  // WORSE 2: another bad trade (different pair) if possible
   const worse2Trade = makeBadSwapDifferentPair(s, rates, `${worse1.buyCcy}/${worse1.sellCcy}`) ?? worse1;
 
   const tiles: GuidedTile[] = [
-    makeGuidedTile(rates, best, "Best", `Best: solves ${focus} funding into the target range on t+0 (USD-equivalent).`),
-    makeGuidedTile(rates, marginal, "Marginal", `Marginal: moves ${focus} toward target, but only ~half as effective as Best.`),
-    makeGuidedTile(rates, worse1, "Worse", `Worse: pushes ${focus} away from target (wrong-way direction).`),
-    makeGuidedTile(rates, worse2Trade, "Worse", `Worse: increases today’s funding risk versus the objective.`),
+    makeGuidedTile(rates, best, "Best", 10, `Best: solves ${focus} funding into the target range on t+0 (USD-equivalent).`),
+    makeGuidedTile(rates, marginalClamped, "Marginal", 5, `Marginal: moves ${focus} toward target, but only ~half as effective as Best.`),
+    makeGuidedTile(rates, worse1, "Worse", -5, `Worse: pushes ${focus} away from target (wrong-way direction).`),
+    makeGuidedTile(rates, worse2Trade, "Worse", -5, `Worse: increases today’s funding risk versus the objective.`),
   ];
 
-  return deterministicShuffle(tiles, seed);
+  // shuffle so Best isn't always in same position
+  return tiles.sort(() => Math.random() - 0.5);
 }
 
-function computeBestPossibleCostGuided(startScenario: Scenario, rates: UsdRates, seedBase: number) {
+function computeBestPossibleCostGuided(startScenario: Scenario, rates: UsdRates) {
+  // Simulate “perfect play” by always picking the Best tile at each step (up to 15 or until solved).
   let s = shallowCopyScenario(startScenario);
   let cost = 0;
 
   for (let step = 0; step < GUIDED_MAX_STEPS; step++) {
     if (solvedT0Long0to5mUsdEq(s.balances, rates)) break;
-    const tiles = buildGuidedFourTiles(s, rates, seedBase + step * 97);
+    const tiles = buildGuidedFourTiles(s, rates);
     const best = tiles.find((t) => t.category === "Best") ?? tiles[0];
     if (!best) break;
     if (Number.isFinite(best.usdCost as any)) cost += best.usdCost as number;
@@ -681,11 +711,8 @@ function Banner({ dayNumber }: { dayNumber: number }) {
     <div className="flex items-center justify-between bg-white border border-slate-200 rounded-2xl shadow-sm px-5 py-4">
       <div className="flex flex-col gap-1">
         <div className="text-lg font-semibold text-slate-900">Day {dayNumber}</div>
-        <div className="text-xs font-bold text-slate-600">t+0 is cash at bank plus executed trades.</div>
       </div>
-      <div className="text-xs text-slate-700 font-semibold">
-        Goal: every non-USD t+0 must be LONG and within $0 to $5m USD-equivalent.
-      </div>
+      <div className="text-sm text-slate-900 font-semibold">Blotter shows net cashflows by day. t+0 is cash at bank plus executed trades.</div>
     </div>
   );
 }
@@ -751,7 +778,17 @@ function Pill({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-function InfoModal({ open, title, message, onOk }: { open: boolean; title: string; message: string; onOk: () => void }) {
+function InfoModal({
+  open,
+  title,
+  message,
+  onOk,
+}: {
+  open: boolean;
+  title: string;
+  message: string;
+  onOk: () => void;
+}) {
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
@@ -819,9 +856,9 @@ type TradeLogItem = {
 type BasicDecision = {
   id: string;
   action: "execute" | "reject";
-  wasGood: boolean;
-  correct: boolean;
-  executed: boolean;
+  wasGood: boolean; // whether correct action would be execute
+  correct: boolean; // whether user's decision matched
+  executed: boolean; // whether trade actually executed
   timestamp: number;
 };
 
@@ -838,12 +875,12 @@ type DayResult = {
   mode: "basic" | "guided";
   scoreCorrect: number;
   scoreTotal: number;
-  scoreText: string;
+  scoreText: string; // "x/y"
   costActual: number;
   costBest: number;
-  costVariance: number;
-  note: string;
-  guidedMarginalPct?: number | null;
+  costVariance: number; // actual - best
+  note: string; // improving / harder day / etc
+  guidedMarginalPct?: number | null; // percent of correct that were marginal
 };
 
 export default function Page() {
@@ -909,13 +946,16 @@ export default function Page() {
   // Shared scenario
   const [scenario, setScenario] = useState<Scenario>(() => generateScenarioRaw());
 
+  // When rates become OK, cap scenario so JPY/MXN/PHP can be big (<=100m USD eq)
   useEffect(() => {
     if (rates.status !== "ok") return;
     setScenario((s) => capScenarioToUsdEq(s, rates));
   }, [rates.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Trade log
+  // Trade log (actual executed swaps)
   const [tradeLog, setTradeLog] = useState<TradeLogItem[]>([]);
+
+  // Execution history (for undo)
   const [history, setHistory] = useState<HistoryItem[]>([]);
 
   const totalCost = useMemo(() => {
@@ -924,17 +964,20 @@ export default function Page() {
     return t;
   }, [tradeLog]);
 
+  // Daily summaries (basic + guided)
   const [dayResults, setDayResults] = useState<DayResult[]>([]);
   const lastBasicScorePctRef = useRef<number | null>(null);
   const lastGuidedScorePctRef = useRef<number | null>(null);
 
   function logTrade(t: SwapTrade, correct?: boolean, mode?: TradeLogItem["mode"], tag?: TradeLogItem["tag"]) {
     const usdC =
-      ratesRef.current.status === "ok" ? swapUsdCost({ notionalBuy: t.notionalBuy, spot: t.spot, fwd: t.fwd, sellCcy: t.sellCcy }, ratesRef.current) : NaN;
+      ratesRef.current.status === "ok"
+        ? swapUsdCost({ notionalBuy: t.notionalBuy, spot: t.spot, fwd: t.fwd, sellCcy: t.sellCcy }, ratesRef.current)
+        : NaN;
 
     const item: TradeLogItem = {
       id: id(),
-      label: `${tag ? `${tag} · ` : ""}Buy ${t.buyCcy} / Sell ${t.sellCcy} · ${formatM(t.notionalBuy)} ${t.buyCcy} (t+${t.nearOffset} vs t+${t.farOffset})`,
+      label: `${tag ? `${tag} · ` : ""}Buy ${t.buyCcy} / Sell ${t.sellCcy} · ${formatM(t.notionalBuy)} ${t.buyCcy}`,
       usdCost: Number.isFinite(usdC) ? usdC : null,
       timestamp: Date.now(),
       correct,
@@ -954,8 +997,10 @@ export default function Page() {
     const h = history.find((x) => x.mode === mode);
     if (!h) return;
 
+    // restore scenario
     setScenario(h.scenarioBefore);
 
+    // remove from history
     setHistory((prev) => {
       const idx = prev.findIndex((x) => x === h);
       if (idx < 0) return prev;
@@ -964,8 +1009,10 @@ export default function Page() {
       return next;
     });
 
+    // remove the corresponding log entry (UNDO removes it in guided/manual)
     setTradeLog((prev) => prev.filter((x) => x.id !== h.logId));
 
+    // Also clear previews
     setPreviewScenario(null);
     setManualPreview(null);
   }
@@ -987,32 +1034,6 @@ export default function Page() {
     setDayResults((prev) => [r, ...prev]);
   }
 
-  function hardResetPerDayState() {
-    setTradeLog([]);
-    setHistory([]);
-
-    // Basic reset
-    setBasicDecisions([]);
-    setBasicIncorrect({ active: false });
-    setBasicPlan([]);
-    setBasicIndex(0);
-    setBasicBestCostTarget(0);
-
-    // Guided reset
-    setGuidedStep(0);
-    setGuidedTiles([]);
-    setGuidedLastExec(null);
-    setGuidedRevealGrade(false);
-    setGuidedReversalPrompt(null);
-    setPreviewScenario(null);
-    setGuidedCorrectExec(0);
-    setGuidedMarginalCorrectExec(0);
-    setGuidedBestCostTarget(0);
-
-    // Manual reset preview only
-    setManualPreview(null);
-  }
-
   function rollDayWithMessage(message: string) {
     setModal({
       open: true,
@@ -1020,9 +1041,33 @@ export default function Page() {
       message,
       onOk: () => {
         closeModal();
+        // roll value date + reset per-day state
         setScenario((s) => rollValueDate(s));
         setDayNumber((d) => d + 1);
-        hardResetPerDayState();
+
+        setTradeLog([]);
+        setHistory([]);
+
+        // Basic reset
+        setBasicDecisions([]);
+        setBasicIncorrect({ active: false });
+        setBasicPlan([]);
+        setBasicIndex(0);
+        setBasicBestCostTarget(0);
+
+        // Guided reset
+        setGuidedStep(0);
+        setGuidedTiles([]);
+        setGuidedReveal(new Set());
+        setGuidedSelected(null);
+        setGuidedReversalPrompt(null);
+        setPreviewScenario(null);
+        setGuidedCorrectExec(0);
+        setGuidedMarginalCorrectExec(0);
+        setGuidedBestCostTarget(0);
+
+        // Manual reset preview only
+        setManualPreview(null);
       },
     });
   }
@@ -1036,6 +1081,11 @@ export default function Page() {
     return { correct, total };
   }, [basicDecisions]);
 
+  const swapsTradedCorrectExecuted = useMemo(
+    () => basicDecisions.filter((d) => d.correct && d.executed).length,
+    [basicDecisions]
+  );
+
   // Basic state
   const [basicPlan, setBasicPlan] = useState<BasicSuggestion[]>([]);
   const [basicIndex, setBasicIndex] = useState(0);
@@ -1043,9 +1093,12 @@ export default function Page() {
 
   const basicSuggestion = useMemo(() => (basicPlan[basicIndex] ? basicPlan[basicIndex] : null), [basicPlan, basicIndex]);
 
-  const [basicIncorrect, setBasicIncorrect] = useState<{ active: boolean; lastScenarioBefore?: Scenario; changedCells?: Set<string>; prevValues?: Record<string, number> }>({
-    active: false,
-  });
+  const [basicIncorrect, setBasicIncorrect] = useState<{
+    active: boolean;
+    lastScenarioBefore?: Scenario;
+    changedCells?: Set<string>;
+    prevValues?: Record<string, number>;
+  }>({ active: false });
 
   function diffCellsAndPrev(a: Scenario, b: Scenario) {
     const va = cashflowView(a);
@@ -1064,6 +1117,7 @@ export default function Page() {
     return { changed, prev };
   }
 
+  // Build basic plan whenever rates OK and scenario/day changes (and not in an incorrect/undo state)
   useEffect(() => {
     if (rates.status !== "ok") return;
     if (basicIncorrect.active) return;
@@ -1083,18 +1137,23 @@ export default function Page() {
 
     const s0 = scenario;
 
+    // correct action: execute if isGood else reject
     const correct = action === "execute" ? basicSuggestion.isGood : !basicSuggestion.isGood;
 
+    // If user executes, trade executes. If user rejects, trade does not execute.
+    // Penalty behavior: if user is incorrect, we execute anyway (same as before), with undo & next.
     const shouldExecute = action === "execute" ? true : false;
     const willExecute = correct ? shouldExecute : true;
 
     recordBasicDecision(action, basicSuggestion.isGood, correct, willExecute && correct);
 
     if (!willExecute) {
+      // correct reject on a bad suggestion => just advance
       setBasicIndex((i) => Math.min(i + 1, basicPlan.length));
       return;
     }
 
+    // execute trade
     const afterScenario = applyFxSwap(s0, basicSuggestion);
     setScenario(afterScenario);
 
@@ -1106,19 +1165,21 @@ export default function Page() {
       return;
     }
 
+    // incorrect: show changed cells, allow undo
     const { changed, prev } = diffCellsAndPrev(s0, afterScenario);
     setBasicIncorrect({ active: true, lastScenarioBefore: s0, changedCells: changed, prevValues: prev });
   }
 
   function basicUndoAndNext() {
-    if (!basicIncorrect.active || !basicIncorrect.lastScenarioBefore) return;
+    if (!basicIncorrect.active || !basicIncorrect.lastScenarioBefore || ratesRef.current.status !== "ok") return;
     const restored = basicIncorrect.lastScenarioBefore;
     setScenario(restored);
     setBasicIncorrect({ active: false });
-    setBasicIndex((i) => Math.min(i + 1, basicPlan.length));
+    setBasicIndex((i) => Math.min(i + 1, basicPlan.length)); // move on to next suggestion
   }
 
   function basicFinalizeDayAndRoll() {
+    // compute score + cost vs target and roll
     const correct = basicScore.correct;
     const total = basicScore.total;
     const scorePct = total > 0 ? correct / total : 0;
@@ -1163,48 +1224,56 @@ export default function Page() {
     rollDayWithMessage(msg);
   }
 
+  // Auto-roll when basic solved
   useEffect(() => {
     if (rates.status !== "ok") return;
     if (tab !== "basic") return;
     if (basicIncorrect.active) return;
 
     const solved = solvedT0Long0to5mUsdEq(scenario.balances, rates);
-    if (solved) basicFinalizeDayAndRoll();
+    if (solved) {
+      basicFinalizeDayAndRoll();
+    }
   }, [scenario, rates.status, tab, basicIncorrect.active]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ----------------------------- Guided state ----------------------------- */
 
   const [guidedStep, setGuidedStep] = useState(0);
   const [guidedTiles, setGuidedTiles] = useState<GuidedTile[]>([]);
+  const [guidedReveal, setGuidedReveal] = useState<Set<string>>(new Set());
+  const [guidedSelected, setGuidedSelected] = useState<GuidedTile | null>(null);
   const [previewScenario, setPreviewScenario] = useState<Scenario | null>(null);
 
+  // guided scoring (correct/total) where correct = Best or Marginal
   const [guidedCorrectExec, setGuidedCorrectExec] = useState(0);
   const [guidedMarginalCorrectExec, setGuidedMarginalCorrectExec] = useState(0);
   const guidedScore = useMemo(() => ({ correct: guidedCorrectExec, total: guidedStep }), [guidedCorrectExec, guidedStep]);
 
   const [guidedBestCostTarget, setGuidedBestCostTarget] = useState(0);
 
-  const [guidedLastExec, setGuidedLastExec] = useState<{ tile: GuidedTile; correct: boolean } | null>(null);
-  const [guidedRevealGrade, setGuidedRevealGrade] = useState(false);
-
-  const [guidedReversalPrompt, setGuidedReversalPrompt] = useState<{ open: boolean; lastScenarioBefore: Scenario; lastTrade: GuidedTile } | null>(null);
+  // reversal prompt
+  const [guidedReversalPrompt, setGuidedReversalPrompt] = useState<{
+    open: boolean;
+    lastScenarioBefore: Scenario;
+    lastTrade: GuidedTile;
+  } | null>(null);
 
   const swapsLeft = GUIDED_MAX_STEPS - guidedStep;
 
-  function refreshGuidedTiles(currentScenario: Scenario, stepSeed: number) {
+  function refreshGuidedTiles(currentScenario: Scenario) {
     if (ratesRef.current.status !== "ok") return;
-    const tiles = buildGuidedFourTiles(currentScenario, ratesRef.current, stepSeed);
+    const tiles = buildGuidedFourTiles(currentScenario, ratesRef.current);
     setGuidedTiles(tiles);
+    setGuidedReveal(new Set());
+    setGuidedSelected(null);
     setPreviewScenario(null);
   }
 
   useEffect(() => {
     if (rates.status !== "ok") return;
-    const seedBase = dayNumber * 100000 + 17;
-    refreshGuidedTiles(scenario, seedBase + guidedStep * 97);
-    setGuidedBestCostTarget(computeBestPossibleCostGuided(scenario, rates, seedBase));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rates.status, dayNumber]);
+    refreshGuidedTiles(scenario);
+    setGuidedBestCostTarget(computeBestPossibleCostGuided(scenario, rates));
+  }, [rates.status, dayNumber]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function previewGuided(t: GuidedTile) {
     if (!previewEnabled) return;
@@ -1222,6 +1291,15 @@ export default function Page() {
 
     setScenario(after);
 
+    // reveal AFTER execute
+    setGuidedReveal((prev) => {
+      const n = new Set(prev);
+      n.add(t.id);
+      return n;
+    });
+    setGuidedSelected(t);
+
+    // scoring: correct = Best or Marginal
     const isCorrect = t.category === "Best" || t.category === "Marginal";
     if (isCorrect) {
       setGuidedCorrectExec((x) => x + 1);
@@ -1232,42 +1310,41 @@ export default function Page() {
     pushHistory(before, t, logId, "guided");
 
     setGuidedStep((x) => x + 1);
+    setPreviewScenario(null);
 
-    // grading NOT immediate
-    setGuidedLastExec({ tile: t, correct: isCorrect });
-    setGuidedRevealGrade(false);
-
-    // prompt reversal if clearly worse
+    // If it clearly went wrong (badness got worse), offer reversal
     if (afterBad > beforeBad) {
       setGuidedReversalPrompt({ open: true, lastScenarioBefore: before, lastTrade: t });
     }
 
-    // new tiles for next decision (deterministic)
-    const seedBase = dayNumber * 100000 + 17;
-    refreshGuidedTiles(after, seedBase + (guidedStep + 1) * 97);
+    // Always regenerate a fresh set of 4 tiles after an execute
+    refreshGuidedTiles(after);
   }
 
   function guidedDoReversalYes() {
     if (!guidedReversalPrompt) return;
     const { lastScenarioBefore, lastTrade } = guidedReversalPrompt;
 
+    // Undo blotter impact
     setScenario(lastScenarioBefore);
     setPreviewScenario(null);
 
+    // Keep cost tracker for original trade, and add reversal trade entry
     const rev = invertTrade(lastTrade);
     logTrade(rev, undefined, "guided", "REVERSAL");
 
+    // Do NOT refund swaps left, do NOT remove original log, do NOT undo history.
     setGuidedReversalPrompt(null);
 
-    const seedBase = dayNumber * 100000 + 17;
-    refreshGuidedTiles(lastScenarioBefore, seedBase + guidedStep * 97);
+    // Refresh tiles from restored scenario
+    refreshGuidedTiles(lastScenarioBefore);
   }
 
   function guidedDoReversalNo() {
     setGuidedReversalPrompt(null);
   }
 
-  function guidedFinalizeDayAndRoll(finalMessagePrefix: string) {
+  function guidedFinalizeDayAndRoll(finalMessagePrefix: string, solved: boolean) {
     const correct = guidedScore.correct;
     const total = guidedScore.total;
     const scorePct = total > 0 ? correct / total : 0;
@@ -1316,20 +1393,34 @@ export default function Page() {
     rollDayWithMessage(msg);
   }
 
+  // Guided end-of-day logic when swaps reach zero
   useEffect(() => {
     if (rates.status !== "ok") return;
     if (tab !== "guided") return;
+    if (guidedStep < GUIDED_MAX_STEPS) return;
 
     const solved = solvedT0Long0to5mUsdEq(scenario.balances, rates);
-
     if (solved) {
-      guidedFinalizeDayAndRoll("Well done, the value date will now roll.");
+      guidedFinalizeDayAndRoll("Well done, the value date will now roll.", true);
       return;
     }
 
-    if (guidedStep >= GUIDED_MAX_STEPS) {
-      guidedFinalizeDayAndRoll("You ran out of time, the value date will now roll.");
+    // If all non-USD are long but some > 5m -> idle cash
+    const u = usdEqT0(scenario.balances, rates);
+    let allLong = true;
+    let anyIdle = false;
+    for (const c of CCYS) {
+      if (c === "USD") continue;
+      if (!Number.isFinite(u[c])) continue;
+      if (u[c] < 0) allLong = false;
+      if (u[c] > TOL_USD_EQ) anyIdle = true;
     }
+    if (allLong && anyIdle) {
+      guidedFinalizeDayAndRoll("Everything got funded, but we left idle cash on the table.", false);
+      return;
+    }
+
+    guidedFinalizeDayAndRoll("You ran out of time, the value date will now roll.", false);
   }, [guidedStep, scenario, rates.status, tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ----------------------------- Manual swap entry ----------------------------- */
@@ -1372,7 +1463,16 @@ export default function Page() {
     if (!sp) return null;
     const fw = forwardFromSpot(sp, buyCcy, sellCcy, Math.max(1, mFar - mNear));
 
-    const t0: SwapTrade = { buyCcy, sellCcy, notionalBuy: Math.round(nBuy), nearOffset: mNear, farOffset: mFar, spot: sp, fwd: fw };
+    const t0: SwapTrade = {
+      buyCcy,
+      sellCcy,
+      notionalBuy: Math.round(nBuy),
+      nearOffset: mNear,
+      farOffset: mFar,
+      spot: sp,
+      fwd: fw,
+    };
+
     return clampNotionalBuyToUsdEq(t0, ratesRef.current);
   }
 
@@ -1446,23 +1546,6 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rates.status, c1, c2, nearBuysC1, mNear, mFar, nearBuyStr]);
 
-  function manualPreviewTrade() {
-    const t = buildTradeFromManual();
-    if (!t) return;
-    setManualPreview(applyFxSwap(scenario, t));
-  }
-
-  function manualExecuteTrade() {
-    const t = buildTradeFromManual();
-    if (!t || ratesRef.current.status !== "ok") return;
-    const before = scenario;
-    const after = applyFxSwap(before, t);
-    setScenario(after);
-    const logId = logTrade(t, undefined, "manual");
-    pushHistory(before, t, logId, "manual");
-    setManualPreview(null);
-  }
-
   /* ----------------------------- Reset / Roll ----------------------------- */
 
   function resetAll() {
@@ -1470,13 +1553,33 @@ export default function Page() {
     setScenario(ratesRef.current.status === "ok" ? capScenarioToUsdEq(s, ratesRef.current) : s);
     setDayNumber(1);
 
+    setTradeLog([]);
+    setHistory([]);
+
     setDayResults([]);
     lastBasicScorePctRef.current = null;
     lastGuidedScorePctRef.current = null;
 
-    hardResetPerDayState();
+    // Basic
+    setBasicDecisions([]);
+    setBasicIncorrect({ active: false });
+    setBasicPlan([]);
+    setBasicIndex(0);
+    setBasicBestCostTarget(0);
 
-    // Manual defaults
+    // Guided
+    setGuidedStep(0);
+    setGuidedTiles([]);
+    setGuidedReveal(new Set());
+    setGuidedSelected(null);
+    setGuidedReversalPrompt(null);
+    setPreviewScenario(null);
+    setGuidedCorrectExec(0);
+    setGuidedMarginalCorrectExec(0);
+    setGuidedBestCostTarget(0);
+
+    // Manual
+    setManualPreview(null);
     setC1("EUR");
     setC2("USD");
     setNearBuysC1(true);
@@ -1487,12 +1590,14 @@ export default function Page() {
   }
 
   function rollButtonClicked() {
+    // Manual roll behavior: show messages based on state.
     if (ratesRef.current.status === "ok") {
       const solved = solvedT0Long0to5mUsdEq(scenario.balances, ratesRef.current);
       if (solved) {
         rollDayWithMessage("Well done, the value date will now roll.");
         return;
       }
+      // If not all long, but also not all long (some shorts), show short message
       const u = usdEqT0(scenario.balances, ratesRef.current);
       let anyShort = false;
       let anyLong = false;
@@ -1517,6 +1622,11 @@ export default function Page() {
   const displayScenario = tab === "guided" ? previewScenario ?? scenario : tab === "manual" ? manualPreview ?? scenario : scenario;
 
   const solvedNow = useMemo(() => (rates.status === "ok" ? solvedT0Long0to5mUsdEq(scenario.balances, rates) : false), [scenario, rates]);
+  const solvedPreviewOrNow = useMemo(
+    () => (rates.status === "ok" ? solvedT0Long0to5mUsdEq((previewScenario ?? scenario).balances, rates) : false),
+    [scenario, previewScenario, rates]
+  );
+
   const objectiveText = (
     <div className="space-y-1">
       <div className="text-sm font-semibold text-white">
@@ -1529,11 +1639,81 @@ export default function Page() {
     </div>
   );
 
-  /* ----------------------------- Panels ----------------------------- */
+  /* ----------------------------- Cost panel (adds best-possible target) ----------------------------- */
 
-  const bestPossibleCostToday = tab === "basic" ? basicBestCostTarget : tab === "guided" ? guidedBestCostTarget : 0;
+  const bestPossibleCostToday =
+    tab === "basic" ? basicBestCostTarget : tab === "guided" ? guidedBestCostTarget : 0;
 
   const costPanel = (
     <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4">
-      <div className="mt-1 overflow-hidden rounded-2xl border border-slate-200">
-        <div className="px-4 py-3 bg-slate-50 border-b
+      <div className="mt-2 overflow-hidden rounded-2xl border border-slate-200">
+        <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 text-sm font-bold text-slate-900">Cost tracker</div>
+        <div className="max-h-[220px] overflow-auto">
+          {tradeLog.length === 0 ? (
+            <div className="p-4 text-sm font-semibold text-slate-700">No trades yet today.</div>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {tradeLog.map((t) => (
+                <li key={t.id} className="p-3 flex items-center gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-slate-900 truncate">{t.label}</div>
+                    {typeof t.correct === "boolean" ? (
+                      <div className={classNames("text-xs font-bold mt-1", t.correct ? "text-emerald-700" : "text-rose-700")}>
+                        {t.correct ? "Correct" : "Incorrect"}
+                      </div>
+                    ) : null}
+                    {t.mode ? <div className="text-[11px] font-bold text-slate-500 mt-1">{t.mode.toUpperCase()}</div> : null}
+                  </div>
+
+                  <div className="ml-auto text-xs font-extrabold text-slate-900">{t.usdCost === null ? "—" : `$${formatInt(t.usdCost)}`}</div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div className="px-4 py-3 bg-white border-t border-slate-200 space-y-1">
+          <div className="flex items-center">
+            <div className="text-sm font-bold text-slate-900">Running total (today)</div>
+            <div className="ml-auto text-sm font-bold text-slate-900">${formatInt(totalCost)}</div>
+          </div>
+
+          {(tab === "basic" || tab === "guided") && Number.isFinite(bestPossibleCostToday as any) ? (
+            <div className="flex items-center">
+              <div className="text-xs font-bold text-slate-600">Best possible (today)</div>
+              <div className="ml-auto text-xs font-extrabold text-slate-900">${formatInt(bestPossibleCostToday)}</div>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+
+  /* ----------------------------- Day results panel ----------------------------- */
+
+  const dayResultsPanel = (
+    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4">
+      <div className="overflow-hidden rounded-2xl border border-slate-200">
+        <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 text-sm font-bold text-slate-900">Daily results</div>
+        {dayResults.length === 0 ? (
+          <div className="p-4 text-sm font-semibold text-slate-700">No completed days yet.</div>
+        ) : (
+          <div className="max-h-[260px] overflow-auto">
+            <ul className="divide-y divide-slate-100">
+              {dayResults.map((r) => (
+                <li key={r.id} className="p-3">
+                  <div className="flex items-start gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-extrabold text-slate-900">
+                        Day {r.dayNumber} · {r.mode.toUpperCase()}
+                      </div>
+                      <div className="text-xs font-bold text-slate-600 mt-1">{r.note}</div>
+                      {r.mode === "guided" ? (
+                        <div className="text-xs font-bold text-slate-600 mt-1">
+                          Marginal % of correct: {typeof r.guidedMarginalPct === "number" ? `${r.guidedMarginalPct.toFixed(0)}%` : "—"}
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="ml-auto text-right">
+                      <div className="text-sm font-extrabold text-slate
