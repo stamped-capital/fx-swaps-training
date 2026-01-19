@@ -1726,7 +1726,7 @@ const dayResultsPanel = (
 
                     <div className="ml-auto text-right">
                       <div className="text-sm font-extrabold text-slate-900">
-                        {r.score ?? ""}
+                         {r.scoreText ?? `${r.scoreCorrect}/${r.scoreTotal}`}
                       </div>
                     </div>
                   </div>
