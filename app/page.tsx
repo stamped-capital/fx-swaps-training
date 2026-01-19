@@ -1,6 +1,7 @@
-code = r'''"use client";
+"use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+
 
 /**
  * FX Swaps Training Tool — Single-file Page (Next.js App Router)
